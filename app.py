@@ -104,18 +104,19 @@ with tab1:
         if not src_files:
             st.warning("먼저 이미지를 선택하세요.")
         else:
-            count = 0
             for f in src_files:
-                # S3 업로드
-                s3_key = upload_to_s3(f, prefix="source-images")
-                s3_url = f"s3://{BUCKET}/{s3_key}"
+                # 1) 업로드된 파일 내용을 메모리로 읽기
+                data = f.read()
 
-                # phash 계산
-                f.seek(0)
-                phash = calc_phash(f)
+                # 2) phash 계산용
+                phash = calc_phash(BytesIO(data))
                 phash_str = str(phash)
 
-                # DB 기록
+                # 3) S3 업로드용 (다시 BytesIO로 감싸서 전달)
+                s3_key = upload_to_s3(BytesIO(data), prefix="source-images")
+                s3_url = f"s3://{BUCKET}/{s3_key}"
+
+                # 4) DB 기록
                 insert_image_record(f.name, s3_url, phash_str)
                 count += 1
 
