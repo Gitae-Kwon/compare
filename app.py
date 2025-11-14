@@ -177,17 +177,18 @@ with tab1:
                 disabled=["id", "file_name", "s3_url", "phash", "uploaded_at"],  # 이 컬럼들은 수정 불가
                 key="image_table_editor",
             )
-    try:
-       selection = st.session_state["image_table_editor"].get("selected_rows", [])
-    except KeyError:
-        selection = []
+    # 선택된 행의 이미지 미리보기
+    selected_rows = []
+    if "image_table_editor" in st.session_state:
+        selected_rows = st.session_state["image_table_editor"].get("selected_rows", [])
 
-    if selection:
+    if selected_rows:
         # data_editor에서 선택된 첫 번째 행 인덱스
-        sel_idx = selection[0]
+        sel_idx = selected_rows[0]
         sel_row = edited_df.iloc[sel_idx]
 
         st.markdown("#### 선택한 원본 이미지 미리보기")
+
         try:
             # s3_url -> key 추출
             key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
