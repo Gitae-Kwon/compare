@@ -46,10 +46,17 @@ def similarity(h1, h2):
     d = h1 - h2  # Hamming distance (0~64)
     return round((1 - d / 64) * 100, 2)
 
+from botocore.exceptions import ClientError
+
 def upload_to_s3(file, prefix="images"):
     ext = os.path.splitext(file.name)[1]
     key = f"{prefix}/{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}{ext}"
-    s3.upload_fileobj(file, BUCKET, key)
+    try:
+        s3.upload_fileobj(file, BUCKET, key)
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        st.error(f"S3 업로드 실패: 코드={err.get('Code')} 메시지={err.get('Message')}")
+        raise
     return key
 
 def load_image_from_s3(key):
