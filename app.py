@@ -163,11 +163,13 @@ with tab1:
             st.success(f"✅ 원본 이미지 {count}개 등록 완료!")
 
     st.markdown("### DB에 저장된 원본 이미지 목록")
+
     try:
         df = load_all_images()
         if df.empty:
             st.info("아직 저장된 원본 이미지가 없습니다.")
         else:
+            # ---- 인라인 편집용 표 ----
             st.write("👉 description 컬럼을 표에서 직접 수정한 뒤, 아래 ‘변경 내용 저장’ 버튼을 눌러주세요.")
 
             edited_df = st.data_editor(
@@ -178,29 +180,6 @@ with tab1:
                 key="image_table_editor",
             )
 
-            # 선택된 행의 이미지 미리보기
-            selected_rows = st.session_state.get("image_table_editor", {}).get(
-                "selected_rows", []
-            )
-
-            if selected_rows:
-                sel_idx = selected_rows[0]
-                sel_row = edited_df.iloc[sel_idx]
-
-                st.markdown("#### 🖼 선택한 원본 이미지 미리보기")
-
-                try:
-                    key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-                    img = load_image_from_s3(key)
-                    st.image(
-                        img,
-                        caption=f"ID {sel_row['id']} | {sel_row['file_name']}",
-                        use_column_width=False,
-                    )
-                except Exception as e:
-                    st.error(f"이미지를 불러오는 중 오류: {e}")
-
-            # 변경 내용 저장 버튼
             if st.button("💾 변경 내용 저장"):
                 try:
                     conn = get_db_conn()
@@ -213,6 +192,71 @@ with tab1:
                     st.success("✅ 모든 변경 내용을 DB에 저장했습니다.")
                 except Exception as e:
                     st.error(f"설명 저장 중 오류: {e}")
+
+            # -------------------------------
+            # 썸네일 리스트 + 미리보기 영역
+            # -------------------------------
+            st.markdown("### 📚 원본 이미지 리스트 + 썸네일")
+
+            # 최신 편집 내용으로 갤러리 표시 (edited_df 사용)
+            list_df = edited_df.copy()
+
+            # 헤더
+            header_cols = st.columns([1, 3, 4, 2, 1])
+            header_cols[0].markdown("**ID**")
+            header_cols[1].markdown("**파일명**")
+            header_cols[2].markdown("**설명**")
+            header_cols[3].markdown("**표지 썸네일**")
+            header_cols[4].markdown("**액션**")
+
+            st.divider()
+
+            for _, row in list_df.iterrows():
+                row_cols = st.columns([1, 3, 4, 2, 1])
+
+                with row_cols[0]:
+                    st.write(row["id"])
+
+                with row_cols[1]:
+                    st.write(row["file_name"])
+
+                with row_cols[2]:
+                    st.write(row.get("description") or "설명 없음")
+
+                with row_cols[3]:
+                    try:
+                        key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+                        img = load_image_from_s3(key)
+                        st.image(img, width=100)
+                    except Exception as e:
+                        st.error(f"이미지 로드 오류: {e}")
+
+                with row_cols[4]:
+                    if st.button("미리보기", key=f"list_preview_{row['id']}"):
+                        st.session_state["preview_image_id"] = row["id"]
+
+            # 아래에 선택한 이미지 큰 미리보기
+            if "preview_image_id" in st.session_state:
+                sel_id = st.session_state["preview_image_id"]
+                try:
+                    sel_row = list_df[list_df["id"] == sel_id].iloc[0]
+
+                    st.markdown("---")
+                    st.markdown("#### 🔍 선택한 이미지 상세 보기")
+
+                    key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+                    img = load_image_from_s3(key)
+                    st.image(
+                        img,
+                        caption=f"ID {sel_row['id']} | {sel_row['file_name']}",
+                        width=400,
+                    )
+                    st.write(f"**파일명:** {sel_row['file_name']}")
+                    st.write(f"**S3 경로:** `{sel_row['s3_url']}`")
+                    st.write(f"**pHash:** `{sel_row['phash']}`")
+                    st.write(f"**설명:** {sel_row.get('description') or '설명 없음'}")
+                except Exception as e:
+                    st.error(f"미리보기 로드 중 오류: {e}")
 
     except Exception as e:
         st.error(f"DB 조회 오류: {e}")
