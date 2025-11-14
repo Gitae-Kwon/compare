@@ -48,15 +48,21 @@ def similarity(h1, h2):
 
 from botocore.exceptions import ClientError
 
-def upload_to_s3(file, prefix="images"):
-    ext = os.path.splitext(file.name)[1]
+def upload_to_s3(file_like, original_name, prefix="images"):
+    # original_name에서 확장자 추출
+    ext = os.path.splitext(original_name)[1]  # 예: ".png"
+    if not ext:
+        ext = ".png"  # 혹시 확장자가 없으면 기본값
+
     key = f"{prefix}/{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}{ext}"
+
     try:
-        s3.upload_fileobj(file, BUCKET, key)
+        s3.upload_fileobj(file_like, BUCKET, key)
     except ClientError as e:
         err = e.response.get("Error", {})
-        st.error(f"S3 업로드 실패: 코드={err.get('Code')} 메시지={err.get('Message')}")
+        st.error(f"S3 업로드 실패: 코드={err.get('Code']} 메시지={err.get('Message')}")
         raise
+
     return key
 
 def load_image_from_s3(key):
