@@ -4,3 +4,4 @@ imagehash
 pymysql
 boto3
 pandas
+cryptography
