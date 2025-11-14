@@ -178,28 +178,29 @@ with tab1:
                 key="image_table_editor",
             )
     # 선택된 행의 이미지 미리보기
-    selected_rows = []
-    if "image_table_editor" in st.session_state:
-        selected_rows = st.session_state["image_table_editor"].get("selected_rows", [])
+    # 선택된 행의 이미지 미리보기
+selected_rows = []
+if "image_table_editor" in st.session_state:
+    selected_rows = st.session_state["image_table_editor"].get("selected_rows", [])
 
-    if selected_rows:
-        # data_editor에서 선택된 첫 번째 행 인덱스
-        sel_idx = selected_rows[0]
-        sel_row = edited_df.iloc[sel_idx]
+if selected_rows:
+    # data_editor에서 선택된 첫 번째 행 인덱스
+    sel_idx = selected_rows[0]
+    sel_row = edited_df.iloc[sel_idx]
 
-        st.markdown("#### 선택한 원본 이미지 미리보기")
+    st.markdown("#### 선택한 원본 이미지 미리보기")
 
-        try:
-            # s3_url -> key 추출
-            key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-            img = load_image_from_s3(key)
-            st.image(
-                img,
-                caption=f"ID {sel_row['id']} | {sel_row['file_name']}",
-                use_column_width=False,
-            )
-        except Exception as e:
-            st.error(f"이미지를 불러오는 중 오류: {e}")
+    try:
+        # s3_url -> key 추출
+        key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+        img = load_image_from_s3(key)
+        st.image(
+            img,
+            caption=f"ID {sel_row['id']} | {sel_row['file_name']}",
+            use_column_width=False,
+        )
+    except Exception as e:
+        st.error(f"이미지를 불러오는 중 오류: {e}")
         
             if st.button("💾 변경 내용 저장"):
                 try:
