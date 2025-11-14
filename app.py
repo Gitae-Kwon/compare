@@ -193,38 +193,6 @@ with tab1:
     except Exception as e:
         st.error(f"DB 조회 오류: {e}")
 
-            # ---------- 설명 수정 UI ----------
-            st.markdown("### 원본 상세 설명 수정")
-
-            selected_id = st.selectbox(
-                "설명을 수정할 이미지 선택 (id 기준)",
-                df["id"].tolist(),
-            )
-
-            row = df[df["id"] == selected_id].iloc[0]
-            current_desc = row.get("description") or ""
-
-            new_desc = st.text_area(
-                "상세 설명 수정",
-                current_desc,
-                key=f"edit_desc_{selected_id}",
-            )
-
-            if st.button("설명 저장", key=f"save_desc_{selected_id}"):
-                try:
-                    conn = get_db_conn()
-                    with conn:
-                        with conn.cursor() as cur:
-                            sql = "UPDATE image_files SET description = %s WHERE id = %s"
-                            cur.execute(sql, (new_desc, selected_id))
-                        conn.commit()
-                    st.success("✅ 설명을 저장했습니다.")
-                except Exception as e:
-                    st.error(f"설명 저장 중 오류: {e}")
-    except Exception as e:
-        st.error(f"DB 조회 오류: {e}")
-
-
 # -------------------------
 # 탭 2: 업로드 이미지 비교
 # -------------------------
