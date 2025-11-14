@@ -143,15 +143,12 @@ with tab1:
                 if not data:
                     continue
 
-                # pHash 계산
                 phash = calc_phash(BytesIO(data))
                 phash_str = str(phash)
 
-                # S3 업로드
                 s3_key = upload_to_s3(BytesIO(data), f.name, prefix="source-images")
                 s3_url = f"s3://{BUCKET}/{s3_key}"
 
-                # DB 기록 (설명 포함)
                 insert_image_record(
                     f.name,
                     s3_url,
@@ -162,27 +159,32 @@ with tab1:
 
             st.success(f"✅ 원본 이미지 {count}개 등록 완료!")
 
-       st.markdown("### DB에 저장된 원본 이미지 목록")
+    # -------------------------
+    # ▼ DB 목록 + 수정 + 썸네일 + 미리보기
+    # -------------------------
+    st.markdown("### DB에 저장된 원본 이미지 목록")
 
     try:
         raw_df = load_all_images()
+
         if raw_df.empty:
             st.info("아직 저장된 원본 이미지가 없습니다.")
+
         else:
-            # 화면에 보일 컬럼만 따로 뽑아서 data_editor에 사용
+            # ▶ data_editor에 보여줄 컬럼만 선택
             view_df = raw_df[["id", "file_name", "description", "uploaded_at"]].copy()
 
-            st.write("👉 description 컬럼을 표에서 직접 수정한 뒤, 아래 ‘변경 내용 저장’ 버튼을 눌러주세요.")
+            st.write("👉 description 컬럼을 수정한 후 ‘변경 내용 저장’을 눌러주세요.")
 
             edited_df = st.data_editor(
                 view_df,
                 use_container_width=True,
-                num_rows="fixed",  # 행 추가/삭제는 막고
-                disabled=["id", "file_name", "uploaded_at"],  # description만 수정 가능
-                key="image_table_editor",
+                num_rows="fixed",
+                disabled=["id", "file_name", "uploaded_at"],
+                key="image_table_editor_v2",
             )
 
-            # 변경 내용 저장
+            # ▼ 변경 내용 DB 저장
             if st.button("💾 변경 내용 저장"):
                 try:
                     conn = get_db_conn()
@@ -192,23 +194,24 @@ with tab1:
                                 sql = "UPDATE image_files SET description = %s WHERE id = %s"
                                 cur.execute(sql, (row["description"], row["id"]))
                         conn.commit()
-                    st.success("✅ 모든 변경 내용을 DB에 저장했습니다.")
+                    st.success("변경 내용이 저장되었습니다.")
                 except Exception as e:
                     st.error(f"설명 저장 중 오류: {e}")
 
-            # ---- 같은 표 행에 썸네일 + 미리보기 붙이기 ----
+            # -------------------------
+            # ▼ 리스트 뷰 + 썸네일 + 미리보기 버튼
+            # -------------------------
             st.markdown("#### 표지 썸네일 & 미리보기")
 
             header_cols = st.columns([1, 3, 4, 2, 1])
             header_cols[0].markdown("**ID**")
             header_cols[1].markdown("**파일명**")
             header_cols[2].markdown("**설명**")
-            header_cols[3].markdown("**표지 썸네일**")
+            header_cols[3].markdown("**썸네일**")
             header_cols[4].markdown("**액션**")
 
             st.divider()
 
-            # 썸네일/버튼에 쓸 전체 데이터(raw_df) 기준으로 루프
             for _, row in raw_df.iterrows():
                 row_cols = st.columns([1, 3, 4, 2, 1])
 
@@ -225,36 +228,31 @@ with tab1:
                     try:
                         key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
                         img = load_image_from_s3(key)
-                        st.image(img, width=100)
+                        st.image(img, width=90)
                     except Exception as e:
-                        st.error(f"이미지 로드 오류: {e}")
+                        st.error("이미지 오류")
 
                 with row_cols[4]:
-                    if st.button("미리보기", key=f"list_preview_{row['id']}"):
+                    if st.button("미리보기", key=f"preview_{row['id']}"):
                         st.session_state["preview_image_id"] = row["id"]
 
-            # 선택한 행 상세 미리보기
+            # ▼ 미리보기 섹션
             if "preview_image_id" in st.session_state:
                 sel_id = st.session_state["preview_image_id"]
-                try:
-                    sel_row = raw_df[raw_df["id"] == sel_id].iloc[0]
+                sel_row = raw_df[raw_df["id"] == sel_id].iloc[0]
 
-                    st.markdown("---")
-                    st.markdown("#### 🔍 선택한 이미지 상세 보기")
+                st.markdown("---")
+                st.markdown("### 🔍 선택한 이미지 미리보기")
 
-                    key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-                    img = load_image_from_s3(key)
-                    st.image(
-                        img,
-                        caption=f"ID {sel_row['id']} | {sel_row['file_name']}",
-                        width=400,
-                    )
-                    st.write(f"**파일명:** {sel_row['file_name']}")
-                    st.write(f"**S3 경로:** `{sel_row['s3_url']}`")
-                    st.write(f"**pHash:** `{sel_row['phash']}`")
-                    st.write(f"**설명:** {sel_row.get('description') or '설명 없음'}")
-                except Exception as e:
-                    st.error(f"미리보기 로드 중 오류: {e}")
+                key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+                img = load_image_from_s3(key)
+
+                st.image(img, width=400, caption=sel_row["file_name"])
+                st.write(f"**ID:** {sel_row['id']}")
+                st.write(f"**파일명:** {sel_row['file_name']}")
+                st.write(f"**설명:** {sel_row.get('description') or '없음'}")
+                st.write(f"**업로드:** {sel_row['uploaded_at']}")
+                st.write(f"**S3 URL:** `{sel_row['s3_url']}`")
 
     except Exception as e:
         st.error(f"DB 조회 오류: {e}")
