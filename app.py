@@ -162,24 +162,27 @@ with tab1:
 
             st.success(f"✅ 원본 이미지 {count}개 등록 완료!")
 
-    st.markdown("### DB에 저장된 원본 이미지 목록")
+       st.markdown("### DB에 저장된 원본 이미지 목록")
 
     try:
-        df = load_all_images()
-        if df.empty:
+        raw_df = load_all_images()
+        if raw_df.empty:
             st.info("아직 저장된 원본 이미지가 없습니다.")
         else:
-            # ---- 1) 인라인 편집용 표 ----
+            # 화면에 보일 컬럼만 따로 뽑아서 data_editor에 사용
+            view_df = raw_df[["id", "file_name", "description", "uploaded_at"]].copy()
+
             st.write("👉 description 컬럼을 표에서 직접 수정한 뒤, 아래 ‘변경 내용 저장’ 버튼을 눌러주세요.")
 
             edited_df = st.data_editor(
-                df,
+                view_df,
                 use_container_width=True,
                 num_rows="fixed",  # 행 추가/삭제는 막고
-                disabled=["id", "file_name", "s3_url", "phash", "uploaded_at"],
+                disabled=["id", "file_name", "uploaded_at"],  # description만 수정 가능
                 key="image_table_editor",
             )
 
+            # 변경 내용 저장
             if st.button("💾 변경 내용 저장"):
                 try:
                     conn = get_db_conn()
@@ -193,12 +196,9 @@ with tab1:
                 except Exception as e:
                     st.error(f"설명 저장 중 오류: {e}")
 
-            # ---- 2) 같은 목록에 썸네일 + 미리보기 UI ----
+            # ---- 같은 표 행에 썸네일 + 미리보기 붙이기 ----
             st.markdown("#### 표지 썸네일 & 미리보기")
 
-            list_df = edited_df.copy()
-
-            # 헤더 (Type 스타일 느낌으로)
             header_cols = st.columns([1, 3, 4, 2, 1])
             header_cols[0].markdown("**ID**")
             header_cols[1].markdown("**파일명**")
@@ -208,7 +208,8 @@ with tab1:
 
             st.divider()
 
-            for _, row in list_df.iterrows():
+            # 썸네일/버튼에 쓸 전체 데이터(raw_df) 기준으로 루프
+            for _, row in raw_df.iterrows():
                 row_cols = st.columns([1, 3, 4, 2, 1])
 
                 with row_cols[0]:
@@ -232,11 +233,11 @@ with tab1:
                     if st.button("미리보기", key=f"list_preview_{row['id']}"):
                         st.session_state["preview_image_id"] = row["id"]
 
-            # 아래에 선택한 이미지 큰 미리보기
+            # 선택한 행 상세 미리보기
             if "preview_image_id" in st.session_state:
                 sel_id = st.session_state["preview_image_id"]
                 try:
-                    sel_row = list_df[list_df["id"] == sel_id].iloc[0]
+                    sel_row = raw_df[raw_df["id"] == sel_id].iloc[0]
 
                     st.markdown("---")
                     st.markdown("#### 🔍 선택한 이미지 상세 보기")
