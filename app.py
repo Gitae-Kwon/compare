@@ -168,7 +168,30 @@ with tab1:
         if df.empty:
             st.info("아직 저장된 원본 이미지가 없습니다.")
         else:
-            st.dataframe(df, use_container_width=True)
+            st.write("👉 description 컬럼을 표에서 직접 수정한 뒤, 아래 ‘변경 내용 저장’ 버튼을 눌러주세요.")
+
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                num_rows="fixed",          # 행 추가/삭제는 막고
+                disabled=["id", "file_name", "s3_url", "phash", "uploaded_at"],  # 이 컬럼들은 수정 불가
+                key="image_table_editor",
+            )
+
+            if st.button("💾 변경 내용 저장"):
+                try:
+                    conn = get_db_conn()
+                    with conn:
+                        with conn.cursor() as cur:
+                            for _, row in edited_df.iterrows():
+                                sql = "UPDATE image_files SET description = %s WHERE id = %s"
+                                cur.execute(sql, (row["description"], row["id"]))
+                        conn.commit()
+                    st.success("✅ 모든 변경 내용을 DB에 저장했습니다.")
+                except Exception as e:
+                    st.error(f"설명 저장 중 오류: {e}")
+    except Exception as e:
+        st.error(f"DB 조회 오류: {e}")
 
             # ---------- 설명 수정 UI ----------
             st.markdown("### 원본 상세 설명 수정")
