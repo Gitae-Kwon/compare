@@ -1,0 +1,6 @@
+streamlit
+pillow
+imagehash
+pymysql
+boto3
+pandas
