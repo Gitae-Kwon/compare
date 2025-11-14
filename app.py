@@ -173,35 +173,34 @@ with tab1:
             edited_df = st.data_editor(
                 df,
                 use_container_width=True,
-                num_rows="fixed",          # 행 추가/삭제는 막고
-                disabled=["id", "file_name", "s3_url", "phash", "uploaded_at"],  # 이 컬럼들은 수정 불가
+                num_rows="fixed",  # 행 추가/삭제는 막고
+                disabled=["id", "file_name", "s3_url", "phash", "uploaded_at"],
                 key="image_table_editor",
             )
-    # 선택된 행의 이미지 미리보기
-    # 선택된 행의 이미지 미리보기
-selected_rows = []
-if "image_table_editor" in st.session_state:
-    selected_rows = st.session_state["image_table_editor"].get("selected_rows", [])
 
-if selected_rows:
-    # data_editor에서 선택된 첫 번째 행 인덱스
-    sel_idx = selected_rows[0]
-    sel_row = edited_df.iloc[sel_idx]
+            # 선택된 행의 이미지 미리보기
+            selected_rows = st.session_state.get("image_table_editor", {}).get(
+                "selected_rows", []
+            )
 
-    st.markdown("#### 선택한 원본 이미지 미리보기")
+            if selected_rows:
+                sel_idx = selected_rows[0]
+                sel_row = edited_df.iloc[sel_idx]
 
-    try:
-        # s3_url -> key 추출
-        key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-        img = load_image_from_s3(key)
-        st.image(
-            img,
-            caption=f"ID {sel_row['id']} | {sel_row['file_name']}",
-            use_column_width=False,
-        )
-    except Exception as e:
-        st.error(f"이미지를 불러오는 중 오류: {e}")
-        
+                st.markdown("#### 🖼 선택한 원본 이미지 미리보기")
+
+                try:
+                    key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+                    img = load_image_from_s3(key)
+                    st.image(
+                        img,
+                        caption=f"ID {sel_row['id']} | {sel_row['file_name']}",
+                        use_column_width=False,
+                    )
+                except Exception as e:
+                    st.error(f"이미지를 불러오는 중 오류: {e}")
+
+            # 변경 내용 저장 버튼
             if st.button("💾 변경 내용 저장"):
                 try:
                     conn = get_db_conn()
@@ -214,6 +213,7 @@ if selected_rows:
                     st.success("✅ 모든 변경 내용을 DB에 저장했습니다.")
                 except Exception as e:
                     st.error(f"설명 저장 중 오류: {e}")
+
     except Exception as e:
         st.error(f"DB 조회 오류: {e}")
 
