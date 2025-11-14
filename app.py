@@ -169,7 +169,7 @@ with tab1:
         if df.empty:
             st.info("아직 저장된 원본 이미지가 없습니다.")
         else:
-            # ---- 인라인 편집용 표 ----
+            # ---- 1) 인라인 편집용 표 ----
             st.write("👉 description 컬럼을 표에서 직접 수정한 뒤, 아래 ‘변경 내용 저장’ 버튼을 눌러주세요.")
 
             edited_df = st.data_editor(
@@ -193,15 +193,12 @@ with tab1:
                 except Exception as e:
                     st.error(f"설명 저장 중 오류: {e}")
 
-            # -------------------------------
-            # 썸네일 리스트 + 미리보기 영역
-            # -------------------------------
-            st.markdown("### 📚 원본 이미지 리스트 + 썸네일")
+            # ---- 2) 같은 목록에 썸네일 + 미리보기 UI ----
+            st.markdown("#### 표지 썸네일 & 미리보기")
 
-            # 최신 편집 내용으로 갤러리 표시 (edited_df 사용)
             list_df = edited_df.copy()
 
-            # 헤더
+            # 헤더 (Type 스타일 느낌으로)
             header_cols = st.columns([1, 3, 4, 2, 1])
             header_cols[0].markdown("**ID**")
             header_cols[1].markdown("**파일명**")
