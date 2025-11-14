@@ -92,7 +92,7 @@ def insert_image_record(file_name, s3_url, phash_str):
                 INSERT INTO image_files (file_name, s3_url, phash)
                 VALUES (%s, %s, %s)
             """
-            cur.execute(sql, (file_name, s3_url, phash_str))
+            cur.execute(sql, (file_name, s3_url, phash_str, description))
         conn.commit()
 
 
@@ -125,6 +125,12 @@ with tab1:
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
         key="src_uploader",
+    )
+    
+    desc_common = st.text_area(
+        "상세 설명 (선택, 여러 장에 공통으로 적용)",
+        "",
+        placeholder="예) 레진코믹스 〈OOO〉 1권 표지, 남주 캐릭터"
     )
 
     if st.button("💾 원본 이미지 S3 + DB 등록"):
