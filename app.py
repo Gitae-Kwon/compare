@@ -83,14 +83,14 @@ def load_image_from_s3(key):
     return Image.open(BytesIO(obj["Body"].read()))
 
 
-def insert_image_record(file_name, s3_url, phash_str):
+def insert_image_record(file_name, s3_url, phash_str, description=None):
     """image_files 테이블에 한 줄 삽입"""
     conn = get_db_conn()
     with conn:
         with conn.cursor() as cur:
             sql = """
-                INSERT INTO image_files (file_name, s3_url, phash)
-                VALUES (%s, %s, %s)
+                INSERT INTO image_files (file_name, s3_url, phash, description)
+                VALUES (%s, %s, %s, %s)
             """
             cur.execute(sql, (file_name, s3_url, phash_str, description))
         conn.commit()
@@ -101,7 +101,7 @@ def load_all_images():
     conn = get_db_conn()
     with conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM image_files")
+            cur.execute("SELECT * FROM image_files ORDER BY id DESC")
             rows = cur.fetchall()
     return pd.DataFrame(rows)
 
@@ -126,11 +126,11 @@ with tab1:
         accept_multiple_files=True,
         key="src_uploader",
     )
-    
+
     desc_common = st.text_area(
         "상세 설명 (선택, 여러 장에 공통으로 적용)",
         "",
-        placeholder="예) 레진코믹스 〈OOO〉 1권 표지, 남주 캐릭터"
+        placeholder="예) 플랫폼/작품명/캐릭터명 등 메모를 입력하세요.",
     )
 
     if st.button("💾 원본 이미지 S3 + DB 등록"):
@@ -139,22 +139,25 @@ with tab1:
         else:
             count = 0
             for f in src_files:
-                # 1) 업로드된 파일 내용을 메모리로 읽기
                 data = f.read()
-
                 if not data:
                     continue
 
-                # 2) phash 계산
+                # pHash 계산
                 phash = calc_phash(BytesIO(data))
                 phash_str = str(phash)
 
-                # 3) S3 업로드
+                # S3 업로드
                 s3_key = upload_to_s3(BytesIO(data), f.name, prefix="source-images")
                 s3_url = f"s3://{BUCKET}/{s3_key}"
 
-                # 4) DB 기록
-                insert_image_record(f.name, s3_url, phash_str)
+                # DB 기록 (설명 포함)
+                insert_image_record(
+                    f.name,
+                    s3_url,
+                    phash_str,
+                    description=desc_common if desc_common else None,
+                )
                 count += 1
 
             st.success(f"✅ 원본 이미지 {count}개 등록 완료!")
@@ -166,6 +169,35 @@ with tab1:
             st.info("아직 저장된 원본 이미지가 없습니다.")
         else:
             st.dataframe(df, use_container_width=True)
+
+            # ---------- 설명 수정 UI ----------
+            st.markdown("### 원본 상세 설명 수정")
+
+            selected_id = st.selectbox(
+                "설명을 수정할 이미지 선택 (id 기준)",
+                df["id"].tolist(),
+            )
+
+            row = df[df["id"] == selected_id].iloc[0]
+            current_desc = row.get("description") or ""
+
+            new_desc = st.text_area(
+                "상세 설명 수정",
+                current_desc,
+                key=f"edit_desc_{selected_id}",
+            )
+
+            if st.button("설명 저장", key=f"save_desc_{selected_id}"):
+                try:
+                    conn = get_db_conn()
+                    with conn:
+                        with conn.cursor() as cur:
+                            sql = "UPDATE image_files SET description = %s WHERE id = %s"
+                            cur.execute(sql, (new_desc, selected_id))
+                        conn.commit()
+                    st.success("✅ 설명을 저장했습니다.")
+                except Exception as e:
+                    st.error(f"설명 저장 중 오류: {e}")
     except Exception as e:
         st.error(f"DB 조회 오류: {e}")
 
@@ -183,7 +215,7 @@ with tab2:
         key="cmp_uploader",
     )
 
-    threshold = st.slider("표시할 최소 유사도(%)", 0, 100, 60, 5)
+    threshold = st.slider("표시할 최소 유사도(%)", 0, 100, 40, 5)
     top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
 
     if st.button("🔎 유사도 분석 실행"):
@@ -194,58 +226,58 @@ with tab2:
             if src_df.empty:
                 st.error("원본 이미지가 아직 없습니다. 먼저 '원본 이미지 등록' 탭에서 추가하세요.")
             else:
-                # 업로드 이미지 phash 계산
                 data = cmp_file.read()
                 if not data:
                     st.error("업로드된 이미지 데이터를 읽을 수 없습니다.")
                 else:
+                    # 업로드 이미지 pHash
                     cmp_hash = calc_phash(BytesIO(data))
 
                     st.markdown("#### 업로드한 이미지")
                     st.image(Image.open(BytesIO(data)), width=300)
 
                     # DB의 phash 문자열 → imagehash 객체
-                    try:
-                        src_df["hash_obj"] = src_df["phash"].apply(
-                            imagehash.hex_to_hash
-                        )
-                    except Exception as e:
-                        st.error(f"DB의 phash 파싱 중 오류: {e}")
-                    else:
-                        results = []
-                        for _, row in src_df.iterrows():
-                            sim = similarity(cmp_hash, row["hash_obj"])
-                            if sim >= threshold:
-                                results.append(
-                                    {
-                                        "id": row["id"],
-                                        "file_name": row["file_name"],
-                                        "s3_url": row["s3_url"],
-                                        "similarity": sim,
-                                    }
-                                )
+                    src_df["hash_obj"] = src_df["phash"].apply(
+                        imagehash.hex_to_hash
+                    )
 
-                        if not results:
-                            st.info(f"유사도 {threshold}% 이상 결과가 없습니다.")
-                        else:
-                            res_df = (
-                                pd.DataFrame(results)
-                                .sort_values("similarity", ascending=False)
-                                .head(top_n)
+                    results = []
+                    for _, row in src_df.iterrows():
+                        sim = similarity(cmp_hash, row["hash_obj"])
+                        if sim >= threshold:
+                            results.append(
+                                {
+                                    "id": row["id"],
+                                    "file_name": row["file_name"],
+                                    "s3_url": row["s3_url"],
+                                    "similarity": sim,
+                                    "description": row.get("description"),
+                                }
                             )
 
-                            st.markdown("#### 유사도 결과")
-                            for _, r in res_df.iterrows():
-                                col1, col2 = st.columns([1, 2])
-                                with col1:
-                                    # s3_url -> key 추출
-                                    key = r["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-                                    img = load_image_from_s3(key)
-                                    st.image(
-                                        img,
-                                        caption=f"ID {r['id']} | {r['file_name']}",
-                                    )
-                                with col2:
-                                    st.write(f"**유사도:** {r['similarity']}%")
-                                    st.write(f"**파일명:** {r['file_name']}")
-                                    st.write(f"**S3 경로:** `{r['s3_url']}`")
+                    if not results:
+                        st.info(f"유사도 {threshold}% 이상 결과가 없습니다.")
+                    else:
+                        res_df = (
+                            pd.DataFrame(results)
+                            .sort_values("similarity", ascending=False)
+                            .head(top_n)
+                        )
+
+                        st.markdown("#### 유사도 결과")
+                        for _, r in res_df.iterrows():
+                            col1, col2 = st.columns([1, 2])
+                            with col1:
+                                key = r["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+                                img = load_image_from_s3(key)
+                                st.image(
+                                    img,
+                                    caption=f"ID {r['id']} | {r['file_name']}",
+                                )
+                            with col2:
+                                st.write(f"**유사도:** {r['similarity']}%")
+                                st.write(f"**파일명:** {r['file_name']}")
+                                st.write(f"**S3 경로:** `{r['s3_url']}`")
+                                st.write(
+                                    f"**설명:** {r['description'] or '설명 없음'}"
+                                )
