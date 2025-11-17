@@ -1,4 +1,5 @@
 import os
+import json
 from io import BytesIO
 from datetime import datetime
 
@@ -9,10 +10,6 @@ import boto3
 from botocore.exceptions import ClientError
 import pymysql
 import pandas as pd
-
-import numpy as np
-import cv2
-import mediapipe as mp
 
 
 # =========================
@@ -44,20 +41,115 @@ def get_db_conn():
 
 
 # =========================
-# 유틸 함수들 (전체 phash)
+# 이미지 해시 / 크롭 유틸
 # =========================
-def calc_phash(file_like):
-    """이미지 파일 객체(또는 BytesIO)에서 perceptual hash 계산"""
-    img = Image.open(file_like).convert("RGB")
-    return imagehash.phash(img)
+def center_crop(img: Image.Image, ratio: float = 0.6) -> Image.Image:
+    """
+    이미지 중앙 기준으로 ratio 비율만큼 크롭 (좌우/상하 모두 중앙)
+    """
+    w, h = img.size
+    cw, ch = int(w * ratio), int(h * ratio)
+    left = (w - cw) // 2
+    top = (h - ch) // 2
+    return img.crop((left, top, left + cw, top + ch))
 
 
-def similarity(h1, h2):
-    """두 pHash 간 해밍거리로 유사도(%) 계산"""
-    d = h1 - h2  # Hamming distance (0~64)
+def top_center_crop(img: Image.Image, width_ratio: float = 0.6, height_ratio: float = 0.6) -> Image.Image:
+    """
+    얼굴이 위쪽에 있을 가능성을 고려한 상단 중심 크롭
+    - 좌우는 중앙 width_ratio 비율
+    - 상단 height_ratio 비율만 사용
+    """
+    w, h = img.size
+    tw = int(w * width_ratio)
+    th = int(h * height_ratio)
+    left = (w - tw) // 2       # 좌우 중앙 정렬
+    top = 0                    # 맨 위부터
+    return img.crop((left, top, left + tw, top + th))
+
+
+def calc_single_phash(img: Image.Image) -> imagehash.ImageHash:
+    """
+    단일 이미지 pHash
+    """
+    return imagehash.phash(img.convert("RGB"))
+
+
+def calc_multi_phash_objects(img: Image.Image) -> dict:
+    """
+    하나의 PIL 이미지에 대해
+    - full
+    - center
+    - top
+    3가지 pHash를 ImageHash 객체로 반환
+    """
+    img = img.convert("RGB")
+
+    full = calc_single_phash(img)
+    center = calc_single_phash(center_crop(img, ratio=0.6))
+    top = calc_single_phash(top_center_crop(img, width_ratio=0.6, height_ratio=0.6))
+
+    return {
+        "full": full,
+        "center": center,
+        "top": top,
+    }
+
+
+def calc_multi_phash_str(img: Image.Image) -> dict:
+    """
+    DB에 저장하기 위한 문자열 버전 해시(dict of str) 반환
+    """
+    hobj = calc_multi_phash_objects(img)
+    return {k: str(v) for k, v in hobj.items()}
+
+
+def similarity(h1: imagehash.ImageHash, h2: imagehash.ImageHash) -> float:
+    """
+    두 pHash 간 해밍거리로 유사도(%) 계산
+    - hamming distance: 0 ~ 64
+    - 유사도 = (1 - d/64) * 100
+    """
+    d = h1 - h2
     return round((1 - d / 64) * 100, 2)
 
 
+def compare_hash_sets(cmp_hashes_obj: dict, db_hashes_str: dict):
+    """
+    비교 이미지 해시(cmp_hashes_obj: dict of ImageHash)
+    DB 저장 해시(db_hashes_str: dict of hex str)
+    를 받아서
+
+    - full, center, top 각각 유사도 (있을 때만)
+    - 단순 평균 유사도(옵션 A)
+
+    를 반환
+    """
+    sims = {}
+    total = 0.0
+    count = 0
+
+    for key in ["full", "center", "top"]:
+        ch = cmp_hashes_obj.get(key)
+        dh_str = db_hashes_str.get(key)
+        if ch is None or not dh_str:
+            continue
+        try:
+            dh = imagehash.hex_to_hash(dh_str)
+            s = similarity(ch, dh)
+            sims[key] = s
+            total += s
+            count += 1
+        except Exception:
+            continue
+
+    avg = round(total / count, 2) if count > 0 else None
+    return sims, avg
+
+
+# =========================
+# S3 / DB 유틸
+# =========================
 def upload_to_s3(file_like, original_name, prefix="images"):
     """
     file_like: BytesIO 또는 파일 객체
@@ -88,89 +180,24 @@ def load_image_from_s3(key):
     return Image.open(BytesIO(obj["Body"].read()))
 
 
-# =========================
-# 얼굴 검출 + 얼굴 phash
-# =========================
-mp_face_detection = mp.solutions.face_detection
-
-
-def crop_main_face(pil_img, expand_ratio=0.25):
-    """
-    PIL 이미지를 받아서 가장 큰 얼굴 영역만 잘라서 반환.
-    얼굴 못 찾으면 None 반환.
-    """
-    img = np.array(pil_img)  # RGB
-    img_height, img_width, _ = img.shape
-
-    with mp_face_detection.FaceDetection(
-        model_selection=1, min_detection_confidence=0.5
-    ) as face_detection:
-        results = face_detection.process(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-
-        if not results.detections:
-            return None
-
-        detection = results.detections[0]
-        bbox = detection.location_data.relative_bounding_box
-
-        x = int(bbox.xmin * img_width)
-        y = int(bbox.ymin * img_height)
-        w = int(bbox.width * img_width)
-        h = int(bbox.height * img_height)
-
-        # 살짝 여유 있게 확장
-        cx, cy = x + w // 2, y + h // 2
-        half_w = int(w * (1 + expand_ratio) / 2)
-        half_h = int(h * (1 + expand_ratio) / 2)
-
-        x1 = max(0, cx - half_w)
-        y1 = max(0, cy - half_h)
-        x2 = min(img_width, cx + half_w)
-        y2 = min(img_height, cy + half_h)
-
-        face_img = img[y1:y2, x1:x2]
-        if face_img.size == 0:
-            return None
-
-        return Image.fromarray(face_img)
-
-
-def calc_face_phash(pil_img):
-    """
-    PIL 이미지에서 얼굴 영역만 잘라 phash 계산.
-    얼굴을 못 찾으면 None 반환.
-    """
-    face = crop_main_face(pil_img)
-    if face is None:
-        return None
-    return imagehash.phash(face)
-
-
-# =========================
-# DB 관련
-# =========================
 def insert_image_record(
-    file_name,
-    s3_url,
-    phash_str,
-    face_phash_str=None,
-    description=None,
+    file_name: str,
+    s3_url: str,
+    phash_json_str: str,
+    description: str | None = None,
 ):
     """
     image_files 테이블에 한 줄 삽입
-    (컬럼: file_name, s3_url, phash, face_phash, description ...)
+    컬럼 예시: id, file_name, s3_url, phash_json(JSON), description, uploaded_at ...
     """
     conn = get_db_conn()
     with conn:
         with conn.cursor() as cur:
             sql = """
-                INSERT INTO image_files (file_name, s3_url, phash, face_phash, description)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO image_files (file_name, s3_url, phash_json, description)
+                VALUES (%s, %s, %s, %s)
             """
-            cur.execute(
-                sql,
-                (file_name, s3_url, phash_str, face_phash_str, description),
-            )
+            cur.execute(sql, (file_name, s3_url, phash_json_str, description))
         conn.commit()
 
 
@@ -188,7 +215,7 @@ def load_all_images():
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="이미지 유사도 검사", layout="wide")
-st.title("🖼 이미지 유사도 검사 (S3 + MySQL + pHash + Face pHash)")
+st.title("🖼 이미지 유사도 검사 (Full / Center / Top pHash + 평균)")
 
 tab1, tab2 = st.tabs(["📥 원본 이미지 등록", "🔍 업로드 이미지 비교"])
 
@@ -221,14 +248,11 @@ with tab1:
                 if not data:
                     continue
 
-                # 전체 phash
-                phash = calc_phash(BytesIO(data))
-                phash_str = str(phash)
-
-                # 얼굴 phash
                 img_full = Image.open(BytesIO(data)).convert("RGB")
-                face_ph = calc_face_phash(img_full)
-                face_phash_str = str(face_ph) if face_ph is not None else None
+
+                # full/center/top pHash (문자열)
+                phash_dict_str = calc_multi_phash_str(img_full)
+                phash_json_str = json.dumps(phash_dict_str)
 
                 # S3 업로드
                 s3_key = upload_to_s3(BytesIO(data), f.name, prefix="source-images")
@@ -238,8 +262,7 @@ with tab1:
                 insert_image_record(
                     f.name,
                     s3_url,
-                    phash_str,
-                    face_phash_str=face_phash_str,
+                    phash_json_str=phash_json_str,
                     description=desc_common if desc_common else None,
                 )
                 count += 1
@@ -343,7 +366,7 @@ with tab1:
                     st.write(f"**ID:** {sel_row['id']}")
                     st.write(f"**파일명:** {sel_row['file_name']}")
                     st.write(f"**설명:** {sel_row.get('description') or '없음'}")
-                    st.write(f"**업로드 시간:** {sel_row['uploaded_at']}")
+                    st.write(f"**업로드 시간:** {sel_row.get('uploaded_at', '')}")
                     st.write(f"**S3 URL:** `{sel_row['s3_url']}`")
                 except Exception as e:
                     st.error(f"미리보기 로드 중 오류: {e}")
@@ -365,7 +388,7 @@ with tab2:
         key="cmp_uploader",
     )
 
-    threshold = st.slider("표시할 최소 유사도(%)", 0, 100, 40, 5)
+    threshold = st.slider("표시할 최소 평균 유사도(%)", 0, 100, 40, 5)
     top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
 
     if st.button("🔎 유사도 분석 실행"):
@@ -380,63 +403,56 @@ with tab2:
                 if not data:
                     st.error("업로드된 이미지 데이터를 읽을 수 없습니다.")
                 else:
-                    # 업로드 이미지 전체 phash
-                    cmp_hash = calc_phash(BytesIO(data))
+                    # 업로드 이미지 전체 로딩
+                    cmp_img = Image.open(BytesIO(data)).convert("RGB")
 
-                    # 업로드 이미지 얼굴 phash
-                    cmp_img_full = Image.open(BytesIO(data)).convert("RGB")
-                    cmp_face_hash = calc_face_phash(cmp_img_full)
+                    # 업로드 이미지의 full/center/top 해시 (ImageHash 객체)
+                    cmp_hashes_obj = calc_multi_phash_objects(cmp_img)
 
                     st.markdown("#### 업로드한 이미지")
-                    st.image(Image.open(BytesIO(data)), width=300)
-
-                    # DB phash 준비
-                    src_df["hash_obj"] = src_df["phash"].apply(imagehash.hex_to_hash)
+                    st.image(cmp_img, width=300)
 
                     results = []
 
                     for _, row in src_df.iterrows():
-                        # 1) 전체 이미지 유사도
-                        sim_full = similarity(cmp_hash, row["hash_obj"])
+                        phash_json_str = row.get("phash_json")
+                        if not phash_json_str:
+                            continue
 
-                        # 2) 얼굴 유사도 (둘 중 하나라도 없으면 None)
-                        sim_face = None
-                        if cmp_face_hash is not None and row.get("face_phash"):
-                            try:
-                                face_hash_db = imagehash.hex_to_hash(row["face_phash"])
-                                sim_face = similarity(cmp_face_hash, face_hash_db)
-                            except Exception:
-                                sim_face = None
+                        try:
+                            db_hashes_str = json.loads(phash_json_str)
+                        except Exception:
+                            continue
 
-                        # 3) 전체 + 얼굴 가중 평균
-                        if sim_face is not None:
-                            final_sim = round(sim_full * 0.4 + sim_face * 0.6, 2)
-                        else:
-                            final_sim = sim_full
+                        sims, avg = compare_hash_sets(cmp_hashes_obj, db_hashes_str)
+                        if avg is None:
+                            continue
 
-                        if final_sim >= threshold:
+                        if avg >= threshold:
                             results.append(
                                 {
                                     "id": row["id"],
                                     "file_name": row["file_name"],
                                     "s3_url": row["s3_url"],
-                                    "similarity": final_sim,
-                                    "sim_full": sim_full,
-                                    "sim_face": sim_face,
+                                    "similarity_avg": avg,
+                                    "sim_full": sims.get("full"),
+                                    "sim_center": sims.get("center"),
+                                    "sim_top": sims.get("top"),
                                     "description": row.get("description"),
                                 }
                             )
 
                     if not results:
-                        st.info(f"유사도 {threshold}% 이상 결과가 없습니다.")
+                        st.info(f"평균 유사도 {threshold}% 이상 결과가 없습니다.")
                     else:
                         res_df = (
                             pd.DataFrame(results)
-                            .sort_values("similarity", ascending=False)
+                            .sort_values("similarity_avg", ascending=False)
                             .head(top_n)
                         )
 
-                        st.markdown("#### 유사도 결과")
+                        st.markdown("#### 유사도 결과 (Full / Center / Top / 평균)")
+
                         for _, r in res_df.iterrows():
                             col1, col2 = st.columns([1, 2])
                             with col1:
@@ -447,10 +463,11 @@ with tab2:
                                     caption=f"ID {r['id']} | {r['file_name']}",
                                 )
                             with col2:
-                                st.write(f"**최종 유사도:** {r['similarity']}%")
+                                st.write(f"**최종 평균 유사도:** {r['similarity_avg']}%")
                                 st.write(
-                                    f"(전체: {r['sim_full']}% / 얼굴: "
-                                    f"{r['sim_face'] if r['sim_face'] is not None else 'N/A'}%)"
+                                    f"- Full: {r['sim_full']}%  "
+                                    f"/ Center: {r['sim_center']}%  "
+                                    f"/ Top: {r['sim_top']}%"
                                 )
                                 st.write(f"**파일명:** {r['file_name']}")
                                 st.write(f"**S3 경로:** `{r['s3_url']}`")
