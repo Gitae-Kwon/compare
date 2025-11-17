@@ -10,6 +10,7 @@ import boto3
 from botocore.exceptions import ClientError
 import pymysql
 import pandas as pd
+import numpy as np
 
 
 # =========================
@@ -41,7 +42,7 @@ def get_db_conn():
 
 
 # =========================
-# 이미지 해시 / 크롭 유틸
+# 이미지 해시 / 크롭 / 벡터 유틸
 # =========================
 def center_crop(img: Image.Image, ratio: float = 0.6) -> Image.Image:
     """
@@ -121,7 +122,7 @@ def compare_hash_sets(cmp_hashes_obj: dict, db_hashes_str: dict):
     를 받아서
 
     - full, center, top 각각 유사도 (있을 때만)
-    - 단순 평균 유사도(옵션 A)
+    - 단순 평균 유사도
 
     를 반환
     """
@@ -145,6 +146,33 @@ def compare_hash_sets(cmp_hashes_obj: dict, db_hashes_str: dict):
 
     avg = round(total / count, 2) if count > 0 else None
     return sims, avg
+
+
+def img_to_vec_center(img: Image.Image, size: int = 64) -> np.ndarray:
+    """
+    중앙 얼굴 영역(center crop)을 기준으로
+    그레이스케일 + size x size 로 축소한 후 1차원 벡터(0~1)로 변환
+    """
+    cropped = center_crop(img, ratio=0.6).convert("L")
+    resized = cropped.resize((size, size))
+    arr = np.asarray(resized, dtype=np.float32).flatten()
+    if arr.size == 0:
+        return arr
+    if arr.max() > 0:
+        arr = arr / 255.0
+    return arr
+
+
+def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+    """
+    두 벡터 사이의 코사인 유사도 (0~100%)
+    """
+    if v1.size == 0 or v2.size == 0:
+        return 0.0
+    denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / denom * 100.0)
 
 
 # =========================
@@ -215,9 +243,11 @@ def load_all_images():
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="이미지 유사도 검사", layout="wide")
-st.title("🖼 이미지 유사도 검사 (Full / Center / Top pHash + 평균)")
+st.title("🖼 이미지 유사도 검사 (pHash + 중앙 얼굴 픽셀 코사인)")
+
 
 tab1, tab2 = st.tabs(["📥 원본 이미지 등록", "🔍 업로드 이미지 비교"])
+
 
 # -------------------------
 # 탭 1: 원본 이미지 등록
@@ -388,7 +418,7 @@ with tab2:
         key="cmp_uploader",
     )
 
-    threshold = st.slider("표시할 최소 평균 유사도(%)", 0, 100, 40, 5)
+    threshold = st.slider("표시할 최소 최종 유사도(%)", 0, 100, 40, 5)
     top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
 
     if st.button("🔎 유사도 분석 실행"):
@@ -408,6 +438,8 @@ with tab2:
 
                     # 업로드 이미지의 full/center/top 해시 (ImageHash 객체)
                     cmp_hashes_obj = calc_multi_phash_objects(cmp_img)
+                    # 업로드 이미지의 중앙 얼굴 벡터 (2차 필터용)
+                    cmp_vec_center = img_to_vec_center(cmp_img)
 
                     st.markdown("#### 업로드한 이미지")
                     st.image(cmp_img, width=300)
@@ -415,43 +447,65 @@ with tab2:
                     results = []
 
                     for _, row in src_df.iterrows():
-                        phash_json_str = row.get("phash_json")
-                        if not phash_json_str:
+                        phash_json_val = row.get("phash_json")
+                        if not phash_json_val:
                             continue
 
+                        # JSON → dict (문자열/JSON 타입 모두 대응)
+                        if isinstance(phash_json_val, dict):
+                            db_hashes_str = phash_json_val
+                        else:
+                            try:
+                                db_hashes_str = json.loads(phash_json_val)
+                            except Exception:
+                                continue
+
+                        # 1차: pHash 기반 유사도들
+                        sims, avg_phash = compare_hash_sets(cmp_hashes_obj, db_hashes_str)
+                        if avg_phash is None:
+                            continue
+
+                        # 2차: 픽셀 기반 코사인 유사도 (중앙 얼굴 영역)
                         try:
-                            db_hashes_str = json.loads(phash_json_str)
+                            key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+                            db_img = load_image_from_s3(key)
+                            db_vec_center = img_to_vec_center(db_img)
+                            pixel_sim = cosine_similarity(cmp_vec_center, db_vec_center)
                         except Exception:
+                            pixel_sim = 0.0
+
+                        # 최종 종합 유사도: pHash 평균과 픽셀 유사도의 단순 평균
+                        final_sim = round((avg_phash + pixel_sim) / 2, 2)
+
+                        # 최종 유사도가 threshold 이상인 것만 남김
+                        if final_sim < threshold:
                             continue
 
-                        sims, avg = compare_hash_sets(cmp_hashes_obj, db_hashes_str)
-                        if avg is None:
-                            continue
-
-                        if avg >= threshold:
-                            results.append(
-                                {
-                                    "id": row["id"],
-                                    "file_name": row["file_name"],
-                                    "s3_url": row["s3_url"],
-                                    "similarity_avg": avg,
-                                    "sim_full": sims.get("full"),
-                                    "sim_center": sims.get("center"),
-                                    "sim_top": sims.get("top"),
-                                    "description": row.get("description"),
-                                }
-                            )
+                        results.append(
+                            {
+                                "id": row["id"],
+                                "file_name": row["file_name"],
+                                "s3_url": row["s3_url"],
+                                "sim_final": final_sim,
+                                "sim_avg_phash": avg_phash,
+                                "sim_pixel": pixel_sim,
+                                "sim_full": sims.get("full"),
+                                "sim_center": sims.get("center"),
+                                "sim_top": sims.get("top"),
+                                "description": row.get("description"),
+                            }
+                        )
 
                     if not results:
-                        st.info(f"평균 유사도 {threshold}% 이상 결과가 없습니다.")
+                        st.info(f"최종 유사도 {threshold}% 이상 결과가 없습니다.")
                     else:
                         res_df = (
                             pd.DataFrame(results)
-                            .sort_values("similarity_avg", ascending=False)
+                            .sort_values("sim_final", ascending=False)
                             .head(top_n)
                         )
 
-                        st.markdown("#### 유사도 결과 (Full / Center / Top / 평균)")
+                        st.markdown("#### 유사도 결과 (pHash / 픽셀 / 최종)")
 
                         for _, r in res_df.iterrows():
                             col1, col2 = st.columns([1, 2])
@@ -463,11 +517,13 @@ with tab2:
                                     caption=f"ID {r['id']} | {r['file_name']}",
                                 )
                             with col2:
-                                st.write(f"**최종 평균 유사도:** {r['similarity_avg']}%")
+                                st.write(f"**최종 종합 유사도:** {r['sim_final']}%")
                                 st.write(
-                                    f"- Full: {r['sim_full']}%  "
-                                    f"/ Center: {r['sim_center']}%  "
-                                    f"/ Top: {r['sim_top']}%"
+                                    f"- pHash 평균: {r['sim_avg_phash']}% "
+                                    f"(full: {r['sim_full']} / center: {r['sim_center']} / top: {r['sim_top']})"
+                                )
+                                st.write(
+                                    f"- 픽셀 코사인 유사도(중앙 얼굴 영역): {round(r['sim_pixel'], 2)}%"
                                 )
                                 st.write(f"**파일명:** {r['file_name']}")
                                 st.write(f"**S3 경로:** `{r['s3_url']}`")
