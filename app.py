@@ -301,18 +301,42 @@ with tab1:
 with tab2:
     st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교 (pHash 멀티크롭 + 픽셀 코사인)")
 
-    cmp_file = st.file_uploader(...)
+    cmp_file = st.file_uploader(
+        "비교할 이미지 1장을 업로드하세요",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=False,
+        key="cmp_uploader",
+    )
 
     min_score = st.slider("표시할 최소 최종 유사도(%)", 0, 100, 40, 5)
     top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
 
-    st.markdown("#### 가중치 설정")
+    # 가중치 (지금은 모두 동일하게 25%씩)
+    w_full = 0.25
+    w_center = 0.25
+    w_top = 0.25
+    w_pixel = 0.25
+
+with tab2:
+    st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교 (pHash 멀티크롭 + 픽셀 코사인)")
+
+    cmp_file = st.file_uploader(
+        "비교할 이미지 1장을 업로드하세요",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=False,
+        key="cmp_uploader",
+    )
+
+    min_score = st.slider("표시할 최소 최종 유사도(%)", 0, 100, 40, 5)
+    top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
+
+    st.markdown("#### 🔧 가중치 설정")
     w_full   = st.slider("전체 pHash 비중", 0.0, 1.0, 0.10, 0.05)
     w_center = st.slider("센터 pHash 비중", 0.0, 1.0, 0.20, 0.05)
     w_top    = st.slider("상단 pHash 비중", 0.0, 1.0, 0.20, 0.05)
     w_pixel  = st.slider("픽셀 코사인 비중", 0.0, 1.0, 0.50, 0.05)
 
-    # 합이 1이 아니어도 되긴 하지만, 감각 맞추려면 정규화할 수도 있음
+    # 합이 1.0이 되도록 정규화
     total_w = w_full + w_center + w_top + w_pixel
     if total_w == 0:
         w_full = w_center = w_top = w_pixel = 0.25
@@ -321,7 +345,7 @@ with tab2:
         w_center /= total_w
         w_top    /= total_w
         w_pixel  /= total_w
-
+        
     if st.button("🔎 유사도 분석 실행"):
         if not cmp_file:
             st.warning("먼저 비교할 이미지를 업로드하세요.")
