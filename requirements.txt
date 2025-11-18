@@ -1,8 +1,8 @@
 streamlit
 pillow
 imagehash
-pymysql
 boto3
+pymysql
 pandas
-cryptography
-opencv-python-headless
+numpy
+scikit-image
