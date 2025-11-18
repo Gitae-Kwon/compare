@@ -1,5 +1,4 @@
 import os
-import json
 from io import BytesIO
 from datetime import datetime
 
@@ -11,8 +10,8 @@ from botocore.exceptions import ClientError
 import pymysql
 import pandas as pd
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
-
+import cv2
+from insightface.app import FaceAnalysis
 
 # =========================
 # 설정 / 클라이언트 초기화
@@ -30,6 +29,14 @@ s3 = boto3.client(
 )
 
 
+@st.cache_resource
+def get_face_app():
+    """InsightFace ArcFace + RetinaFace 초기화 (CPU)"""
+    app = FaceAnalysis(name="buffalo_l")
+    app.prepare(ctx_id=-1, det_size=(256, 256))
+    return app
+
+
 def get_db_conn():
     return pymysql.connect(
         host=mysql_conf["host"],
@@ -43,140 +50,64 @@ def get_db_conn():
 
 
 # =========================
-# 이미지 해시 / 크롭 / SSIM 유틸
+# 유틸 함수들 (해시 / 임베딩)
 # =========================
-def center_crop(img: Image.Image, ratio: float = 0.6) -> Image.Image:
-    """이미지 중앙 기준으로 ratio 비율만큼 크롭"""
-    w, h = img.size
-    cw, ch = int(w * ratio), int(h * ratio)
-    left = (w - cw) // 2
-    top = (h - ch) // 2
-    return img.crop((left, top, left + cw, top + ch))
+def calc_phash(pil_img: Image.Image) -> str:
+    """이미지 pHash -> hex 문자열"""
+    return str(imagehash.phash(pil_img.convert("RGB")))
 
 
-def top_center_crop(img: Image.Image, width_ratio: float = 0.6, height_ratio: float = 0.6) -> Image.Image:
-    """얼굴이 상단에 있을 가능성을 고려한 상단 중심 크롭"""
-    w, h = img.size
-    tw = int(w * width_ratio)
-    th = int(h * height_ratio)
-    left = (w - tw) // 2
-    top = 0
-    return img.crop((left, top, left + tw, top + th))
-
-
-def calc_single_phash(img: Image.Image) -> imagehash.ImageHash:
-    return imagehash.phash(img.convert("RGB"))
-
-
-def calc_multi_phash_objects(img: Image.Image) -> dict:
-    """
-    하나의 PIL 이미지에 대해 full / center / top 3가지 pHash (ImageHash 객체)
-    """
-    img = img.convert("RGB")
-    full = calc_single_phash(img)
-    center = calc_single_phash(center_crop(img, ratio=0.6))
-    top = calc_single_phash(top_center_crop(img, width_ratio=0.6, height_ratio=0.6))
-    return {"full": full, "center": center, "top": top}
-
-
-def calc_multi_phash_str(img: Image.Image) -> dict:
-    """DB 저장용 문자열 버전 pHash"""
-    hobj = calc_multi_phash_objects(img)
-    return {k: str(v) for k, v in hobj.items()}
-
-
-def similarity_p_hash(h1: imagehash.ImageHash, h2: imagehash.ImageHash) -> float:
-    """
-    pHash류 해시의 해밍거리 기반 유사도 (%)
-    """
-    d = h1 - h2  # 0~64
-    return round((1 - d / 64) * 100, 2)
-
-
-def compare_hash_sets(cmp_hashes_obj: dict, db_hashes_str: dict):
-    """
-    (1차 필터용) multi-region pHash 비교
-    """
-    sims = {}
-    total = 0.0
-    count = 0
-
-    for key in ["full", "center", "top"]:
-        ch = cmp_hashes_obj.get(key)
-        dh_str = db_hashes_str.get(key)
-        if ch is None or not dh_str:
-            continue
-        try:
-            dh = imagehash.hex_to_hash(dh_str)
-            s = similarity_p_hash(ch, dh)
-            sims[key] = s
-            total += s
-            count += 1
-        except Exception:
-            continue
-
-    avg = round(total / count, 2) if count > 0 else None
-    return sims, avg
-
-
-def calc_hybrid_hashes_center(img: Image.Image) -> dict:
-    """
-    중앙 크롭(얼굴 영역) 기준으로
-    pHash + aHash + dHash + wHash 4개 해시 반환 (ImageHash 객체)
-    """
-    cimg = center_crop(img, ratio=0.6).convert("L").resize((64, 64))
-    return {
-        "p": imagehash.phash(cimg),
-        "a": imagehash.average_hash(cimg),
-        "d": imagehash.dhash(cimg),
-        "w": imagehash.whash(cimg),
-    }
-
-
-def similarity_hash_dict(h1: dict, h2: dict) -> float | None:
-    """
-    dict 형태의 { 'p': hash, 'a': hash, ... } 4개 해시 평균 유사도
-    """
-    scores = []
-    for k in h1.keys():
-        if k not in h2:
-            continue
-        scores.append(similarity_p_hash(h1[k], h2[k]))
-    if not scores:
+def calc_arcface_embedding(pil_img: Image.Image) -> np.ndarray | None:
+    """PIL 이미지에서 ArcFace 임베딩(512차원) 계산"""
+    app = get_face_app()
+    nimg = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    faces = app.get(nimg)
+    if not faces:
         return None
-    return round(sum(scores) / len(scores), 2)
+    faces.sort(
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+        reverse=True,
+    )
+    emb = faces[0].normed_embedding.astype(np.float32)
+    return emb
 
 
-def prepare_ssim_base(img: Image.Image, size: int = 128) -> np.ndarray:
-    """
-    SSIM 계산용: 중앙 크롭 + 그레이스케일 + size x size → 0~1 float32 배열
-    """
-    cimg = center_crop(img, ratio=0.6).convert("L").resize((size, size))
-    arr = np.asarray(cimg, dtype=np.float32)
-    if arr.max() > 0:
-        arr /= 255.0
-    return arr
+def embedding_to_str(vec: np.ndarray | None) -> str | None:
+    if vec is None:
+        return None
+    return ",".join(f"{x:.6f}" for x in vec.tolist())
 
 
-def calc_ssim_from_arrays(arr1: np.ndarray, arr2: np.ndarray) -> float:
-    """
-    이미 전처리된 두 그레이스케일 배열 사이의 SSIM (%)
-    """
-    try:
-        score = ssim(arr1, arr2, data_range=1.0)
-    except Exception:
+def str_to_embedding(s: str | None) -> np.ndarray | None:
+    if not s:
+        return None
+    return np.fromstring(s, sep=",", dtype=np.float32)
+
+
+def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+    num = float(np.dot(v1, v2))
+    den = float(np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+    return num / den  # -1 ~ 1
+
+
+def phash_similarity(h1: str, h2: str) -> float:
+    """pHash 해밍 거리 기반 유사도 (0~100%)"""
+    if not h1 or not h2:
         return 0.0
-    return float(score * 100.0)
+    a = imagehash.hex_to_hash(h1)
+    b = imagehash.hex_to_hash(h2)
+    d = a - b  # hamming distance
+    sim = (1 - d / 64) * 100
+    return float(round(sim, 2))
 
 
 # =========================
-# S3 / DB 유틸
+# S3 유틸
 # =========================
 def upload_to_s3(file_like, original_name, prefix="images"):
     ext = os.path.splitext(original_name)[1]
     if not ext:
         ext = ".png"
-
     key = f"{prefix}/{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}{ext}"
 
     try:
@@ -194,23 +125,27 @@ def upload_to_s3(file_like, original_name, prefix="images"):
 
 def load_image_from_s3(key):
     obj = s3.get_object(Bucket=BUCKET, Key=key)
-    return Image.open(BytesIO(obj["Body"].read()))
+    return Image.open(BytesIO(obj["Body"].read())).convert("RGB")
 
 
+# =========================
+# DB 유틸
+# =========================
 def insert_image_record(
-    file_name: str,
-    s3_url: str,
-    phash_json_str: str,
+    file_name,
+    s3_url,
+    phash_str: str | None,
     description: str | None = None,
+    face_embed: str | None = None,
 ):
     conn = get_db_conn()
     with conn:
         with conn.cursor() as cur:
             sql = """
-                INSERT INTO image_files (file_name, s3_url, phash_json, description)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO image_files (file_name, s3_url, phash, description, face_embed)
+                VALUES (%s, %s, %s, %s, %s)
             """
-            cur.execute(sql, (file_name, s3_url, phash_json_str, description))
+            cur.execute(sql, (file_name, s3_url, phash_str, description, face_embed))
         conn.commit()
 
 
@@ -218,19 +153,34 @@ def load_all_images():
     conn = get_db_conn()
     with conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM image_files ORDER BY id DESC")
+            cur.execute(
+                "SELECT id, file_name, s3_url, phash, description, uploaded_at, face_embed "
+                "FROM image_files ORDER BY id DESC"
+            )
             rows = cur.fetchall()
     return pd.DataFrame(rows)
+
+
+def update_descriptions_from_df(df: pd.DataFrame):
+    """data_editor로 수정된 description을 DB에 반영"""
+    conn = get_db_conn()
+    with conn:
+        with conn.cursor() as cur:
+            for _, row in df.iterrows():
+                cur.execute(
+                    "UPDATE image_files SET description=%s WHERE id=%s",
+                    (row.get("description"), int(row["id"])),
+                )
+        conn.commit()
 
 
 # =========================
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="이미지 유사도 검사", layout="wide")
-st.title("🖼 이미지 유사도 검사 (pHash + a/d/wHash + SSIM 하이브리드)")
+st.title("🖼 이미지 유사도 검사 (S3 + MySQL + ArcFace)")
 
 tab1, tab2 = st.tabs(["📥 원본 이미지 등록", "🔍 업로드 이미지 비교"])
-
 
 # -------------------------
 # 탭 1: 원본 이미지 등록
@@ -261,128 +211,101 @@ with tab1:
                 if not data:
                     continue
 
-                img_full = Image.open(BytesIO(data)).convert("RGB")
+                pil = Image.open(BytesIO(data)).convert("RGB")
 
-                # full/center/top pHash (문자열)
-                phash_dict_str = calc_multi_phash_str(img_full)
-                phash_json_str = json.dumps(phash_dict_str)
+                # 1) pHash
+                phash_str = calc_phash(pil)
 
-                # S3 업로드
+                # 2) ArcFace 임베딩
+                emb_vec = calc_arcface_embedding(pil)
+                emb_str = embedding_to_str(emb_vec)
+
+                # 3) S3 업로드
                 s3_key = upload_to_s3(BytesIO(data), f.name, prefix="source-images")
                 s3_url = f"s3://{BUCKET}/{s3_key}"
 
-                # DB 기록
+                # 4) DB 기록
                 insert_image_record(
                     f.name,
                     s3_url,
-                    phash_json_str=phash_json_str,
+                    phash_str,
                     description=desc_common if desc_common else None,
+                    face_embed=emb_str,
                 )
                 count += 1
 
             st.success(f"✅ 원본 이미지 {count}개 등록 완료!")
 
-    # ---- DB 목록 & 썸네일 & 설명 편집 ----
-    st.markdown("### 표지 썸네일 & 미리보기 (설명 직접 수정)")
+    st.markdown("### DB에 저장된 원본 이미지 목록")
 
     try:
         df = load_all_images()
-
-        if df.empty:
-            st.info("아직 저장된 원본 이미지가 없습니다.")
-        else:
-            csv = df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "⬇️ 전체 목록 CSV 다운로드",
-                data=csv,
-                file_name="image_files.csv",
-                mime="text/csv",
-            )
-
-            st.markdown("")
-            header_cols = st.columns([1, 3, 4, 2, 1])
-            header_cols[0].markdown("**ID**")
-            header_cols[1].markdown("**파일명**")
-            header_cols[2].markdown("**설명 (수정 가능)**")
-            header_cols[3].markdown("**썸네일**")
-            header_cols[4].markdown("**액션**")
-
-            st.divider()
-
-            updated_rows = []
-
-            for _, row in df.iterrows():
-                row_cols = st.columns([1, 3, 4, 2, 1])
-
-                with row_cols[0]:
-                    st.write(row["id"])
-
-                with row_cols[1]:
-                    st.write(row["file_name"])
-
-                with row_cols[2]:
-                    new_desc = st.text_input(
-                        label="",
-                        value=row.get("description") or "",
-                        key=f"desc_{row['id']}",
-                        placeholder="설명을 입력하세요",
-                    )
-                updated_rows.append({"id": row["id"], "description": new_desc})
-
-                with row_cols[3]:
-                    try:
-                        key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-                        thumb = load_image_from_s3(key)
-                        st.image(thumb, width=90)
-                    except Exception:
-                        st.write("이미지 오류")
-
-                with row_cols[4]:
-                    if st.button("미리보기", key=f"preview_{row['id']}"):
-                        st.session_state["preview_image_id"] = row["id"]
-
-            if st.button("💾 설명 변경 내용 저장"):
-                try:
-                    conn = get_db_conn()
-                    with conn:
-                        with conn.cursor() as cur:
-                            for r in updated_rows:
-                                sql = "UPDATE image_files SET description = %s WHERE id = %s"
-                                cur.execute(sql, (r["description"], r["id"]))
-                        conn.commit()
-                    st.success("설명 변경 내용이 저장되었습니다.")
-                except Exception as e:
-                    st.error(f"설명 저장 중 오류: {e}")
-
-            if "preview_image_id" in st.session_state:
-                sel_id = st.session_state["preview_image_id"]
-                try:
-                    sel_row = df[df["id"] == sel_id].iloc[0]
-
-                    st.markdown("---")
-                    st.markdown("### 🔍 선택한 이미지 미리보기")
-
-                    key = sel_row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-                    img = load_image_from_s3(key)
-
-                    st.image(img, width=400, caption=sel_row["file_name"])
-                    st.write(f"**ID:** {sel_row['id']}")
-                    st.write(f"**파일명:** {sel_row['file_name']}")
-                    st.write(f"**설명:** {sel_row.get('description') or '없음'}")
-                    st.write(f"**업로드 시간:** {sel_row.get('uploaded_at', '')}")
-                    st.write(f"**S3 URL:** `{sel_row['s3_url']}`")
-                except Exception as e:
-                    st.error(f"미리보기 로드 중 오류: {e}")
-
     except Exception as e:
         st.error(f"DB 조회 오류: {e}")
+        df = pd.DataFrame()
 
+    if df.empty:
+        st.info("아직 저장된 원본 이미지가 없습니다.")
+    else:
+        st.write(
+            "👉 description 컬럼을 표에서 직접 수정한 뒤, "
+            "아래 ‘변경 내용 저장’ 버튼을 눌러주세요."
+        )
+
+        edited_df = st.data_editor(
+            df,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled=["id", "file_name", "s3_url", "phash", "uploaded_at", "face_embed"],
+            key="image_table_editor",
+        )
+
+        if st.button("📝 변경 내용 저장"):
+            try:
+                update_descriptions_from_df(edited_df)
+                st.success("설명 변경 내용을 저장했습니다.")
+            except Exception as e:
+                st.error(f"설명 저장 중 오류: {e}")
+
+        # 썸네일 + 미리보기
+        st.markdown("### 표지 썸네일 & 미리보기")
+
+        for _, row in edited_df.iterrows():
+            col_id, col_name, col_desc, col_thumb, col_btn = st.columns(
+                [0.5, 2.5, 3, 1, 1]
+            )
+            with col_id:
+                st.write(int(row["id"]))
+            with col_name:
+                st.write(row["file_name"])
+            with col_desc:
+                st.write(row.get("description") or "")
+
+            key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+            with col_thumb:
+                try:
+                    img = load_image_from_s3(key)
+                    st.image(img, width=80)
+                except Exception:
+                    st.write("썸네일 오류")
+
+            with col_btn:
+                if st.button("미리보기", key=f"preview_{row['id']}"):
+                    try:
+                        img = load_image_from_s3(key)
+                        st.image(
+                            img,
+                            caption=f"ID {row['id']} | {row['file_name']}",
+                            use_column_width=True,
+                        )
+                    except Exception as e:
+                        st.error(f"이미지 로딩 오류: {e}")
 
 # -------------------------
 # 탭 2: 업로드 이미지 비교
 # -------------------------
 with tab2:
-    st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교")
+    st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교 (ArcFace + pHash)")
 
     cmp_file = st.file_uploader(
         "비교할 이미지 1장을 업로드하세요",
@@ -391,8 +314,12 @@ with tab2:
         key="cmp_uploader",
     )
 
-    threshold = st.slider("표시할 최소 최종 유사도(%)", 0, 100, 40, 5)
+    min_score = st.slider("표시할 최소 최종 유사도(%)", 0, 100, 40, 5)
     top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
+
+    # 가중치 (필요하면 UI로 빼도 됨)
+    w_phash = 0.3
+    w_embed = 0.7
 
     if st.button("🔎 유사도 분석 실행"):
         if not cmp_file:
@@ -406,95 +333,54 @@ with tab2:
                 if not data:
                     st.error("업로드된 이미지 데이터를 읽을 수 없습니다.")
                 else:
-                    cmp_img = Image.open(BytesIO(data)).convert("RGB")
+                    pil_cmp = Image.open(BytesIO(data)).convert("RGB")
 
-                    # 1차 필터용 multi-region pHash
-                    cmp_phash_multi = calc_multi_phash_objects(cmp_img)
-
-                    # 2차 정밀 비교용: 중앙 기반 하이브리드 해시 + SSIM base
-                    cmp_hybrid_hash = calc_hybrid_hashes_center(cmp_img)
-                    cmp_ssim_base = prepare_ssim_base(cmp_img)
+                    # 1) 업로드 이미지 pHash / 임베딩
+                    cmp_phash = calc_phash(pil_cmp)
+                    cmp_emb = calc_arcface_embedding(pil_cmp)
 
                     st.markdown("#### 업로드한 이미지")
-                    st.image(cmp_img, width=300)
+                    st.image(pil_cmp, width=260)
 
                     results = []
 
                     for _, row in src_df.iterrows():
-                        phash_json_val = row.get("phash_json")
-                        if not phash_json_val:
-                            continue
+                        row_phash = row.get("phash")
+                        row_emb = str_to_embedding(row.get("face_embed"))
 
-                        if isinstance(phash_json_val, dict):
-                            db_phash_dict_str = phash_json_val
+                        phash_sim = phash_similarity(cmp_phash, row_phash)
+
+                        if cmp_emb is not None and row_emb is not None:
+                            emb_sim = cosine_similarity(cmp_emb, row_emb)
+                            emb_sim_pct = round(max(0.0, emb_sim) * 100, 2)
                         else:
-                            try:
-                                db_phash_dict_str = json.loads(phash_json_val)
-                            except Exception:
-                                continue
+                            emb_sim_pct = 0.0
 
-                        # 1차: pHash 평균 (full/center/top)
-                        sims_p, avg_phash = compare_hash_sets(
-                            cmp_phash_multi, db_phash_dict_str
-                        )
-                        if avg_phash is None:
-                            continue
+                        final_score = w_phash * phash_sim + w_embed * emb_sim_pct
 
-                        # DB 이미지 로딩 (2차용)
-                        try:
-                            key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-                            db_img = load_image_from_s3(key).convert("RGB")
-                        except Exception:
-                            continue
-
-                        # 2-1) 중앙 기반 p/a/d/w 해시 유사도
-                        db_hybrid_hash = calc_hybrid_hashes_center(db_img)
-                        hybrid_sim = similarity_hash_dict(
-                            cmp_hybrid_hash, db_hybrid_hash
-                        )
-                        if hybrid_sim is None:
-                            hybrid_sim = 0.0
-
-                        # 2-2) SSIM (중앙 그레이스케일)
-                        db_ssim_base = prepare_ssim_base(db_img)
-                        ssim_score = calc_ssim_from_arrays(
-                            cmp_ssim_base, db_ssim_base
-                        )
-
-                        # 최종 유사도: pHash avg(40%) + hybrid(40%) + SSIM(20%)
-                        final_sim = round(
-                            avg_phash * 0.4 + hybrid_sim * 0.4 + ssim_score * 0.2, 2
-                        )
-
-                        if final_sim < threshold:
-                            continue
-
-                        results.append(
-                            {
-                                "id": row["id"],
-                                "file_name": row["file_name"],
-                                "s3_url": row["s3_url"],
-                                "sim_final": final_sim,
-                                "sim_avg_phash": avg_phash,
-                                "sim_hybrid": hybrid_sim,
-                                "sim_ssim": ssim_score,
-                                "sim_full": sims_p.get("full"),
-                                "sim_center": sims_p.get("center"),
-                                "sim_top": sims_p.get("top"),
-                                "description": row.get("description"),
-                            }
-                        )
+                        if final_score >= min_score:
+                            results.append(
+                                {
+                                    "id": row["id"],
+                                    "file_name": row["file_name"],
+                                    "s3_url": row["s3_url"],
+                                    "description": row.get("description"),
+                                    "phash_sim": phash_sim,
+                                    "embed_sim": emb_sim_pct,
+                                    "final_score": round(final_score, 2),
+                                }
+                            )
 
                     if not results:
-                        st.info(f"최종 유사도 {threshold}% 이상 결과가 없습니다.")
+                        st.info(f"최종 유사도 {min_score}% 이상 결과가 없습니다.")
                     else:
                         res_df = (
                             pd.DataFrame(results)
-                                .sort_values("sim_final", ascending=False)
-                                .head(top_n)
+                            .sort_values("final_score", ascending=False)
+                            .head(top_n)
                         )
 
-                        st.markdown("#### 유사도 결과 (pHash / 하이브리드 / SSIM / 최종)")
+                        st.markdown("#### 유사도 결과 (pHash / ArcFace / 최종)")
 
                         for _, r in res_df.iterrows():
                             col1, col2 = st.columns([1, 2])
@@ -506,15 +392,11 @@ with tab2:
                                     caption=f"ID {r['id']} | {r['file_name']}",
                                 )
                             with col2:
-                                st.write(f"**최종 종합 유사도:** {r['sim_final']}%")
+                                st.write(f"**최종 유사도:** {r['final_score']}%")
                                 st.write(
-                                    f"- 1차 pHash 평균: {r['sim_avg_phash']}% "
-                                    f"(full: {r['sim_full']} / center: {r['sim_center']} / top: {r['sim_top']})"
+                                    f"- pHash 유사도: {r['phash_sim']}% / "
+                                    f"ArcFace 임베딩 유사도: {r['embed_sim']}%"
                                 )
-                                st.write(
-                                    f"- 2차 중앙 하이브리드 해시(p/a/d/w 평균): {r['sim_hybrid']}%"
-                                )
-                                st.write(f"- 구조적 유사도 SSIM: {round(r['sim_ssim'], 2)}%")
                                 st.write(f"**파일명:** {r['file_name']}")
                                 st.write(f"**S3 경로:** `{r['s3_url']}`")
                                 st.write(
