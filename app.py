@@ -301,6 +301,7 @@ with tab1:
 with tab2:
     st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교 (pHash 멀티크롭 + 픽셀 코사인)")
 
+    # 1) 비교할 이미지 업로드
     cmp_file = st.file_uploader(
         "비교할 이미지 1장을 업로드하세요",
         type=["jpg", "jpeg", "png", "webp"],
@@ -308,28 +309,11 @@ with tab2:
         key="cmp_uploader",
     )
 
+    # 2) 필터 및 상위 개수 설정
     min_score = st.slider("표시할 최소 최종 유사도(%)", 0, 100, 40, 5)
     top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
 
-    # 가중치 (지금은 모두 동일하게 25%씩)
-    w_full = 0.25
-    w_center = 0.25
-    w_top = 0.25
-    w_pixel = 0.25
-
-with tab2:
-    st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교 (pHash 멀티크롭 + 픽셀 코사인)")
-
-    cmp_file = st.file_uploader(
-        "비교할 이미지 1장을 업로드하세요",
-        type=["jpg", "jpeg", "png", "webp"],
-        accept_multiple_files=False,
-        key="cmp_uploader",
-    )
-
-    min_score = st.slider("표시할 최소 최종 유사도(%)", 0, 100, 40, 5)
-    top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
-
+    # 3) 가중치 설정 슬라이더
     st.markdown("#### 🔧 가중치 설정")
     w_full   = st.slider("전체 pHash 비중", 0.0, 1.0, 0.10, 0.05)
     w_center = st.slider("센터 pHash 비중", 0.0, 1.0, 0.20, 0.05)
@@ -345,7 +329,8 @@ with tab2:
         w_center /= total_w
         w_top    /= total_w
         w_pixel  /= total_w
-        
+
+    # 4) 유사도 분석 버튼
     if st.button("🔎 유사도 분석 실행"):
         if not cmp_file:
             st.warning("먼저 비교할 이미지를 업로드하세요.")
@@ -358,6 +343,7 @@ with tab2:
                 if not data:
                     st.error("업로드된 이미지 데이터를 읽을 수 없습니다.")
                 else:
+                    # 업로드 이미지 로드
                     pil_cmp = Image.open(BytesIO(data)).convert("RGB")
 
                     # 업로드 이미지 여러 크롭
