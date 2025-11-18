@@ -6,3 +6,6 @@ pymysql
 pandas
 numpy
 scikit-image
+insightface
+opencv-python-headless
+numpy
