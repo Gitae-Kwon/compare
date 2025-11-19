@@ -1,7 +1,11 @@
 streamlit
-Pillow
+pillow
 imagehash
 boto3
 pymysql
 pandas
 numpy
+opencv-python-headless
+insightface
+onnxruntime
+albumentations
