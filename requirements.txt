@@ -5,11 +5,3 @@ boto3
 pymysql
 pandas
 numpy
-# Linux → mediapipe-lite
-mediapipe-lite ; sys_platform == "linux"
-
-# Mac Silicon → mediapipe-silicon
-mediapipe-silicon ; platform_system == "Darwin" and platform_machine == "arm64"
-
-# Intel 맥 또는 윈도우 → 원래 mediapipe
-mediapipe ; (platform_system == "Darwin" and platform_machine == "x86_64") or platform_system == "Windows"
