@@ -1,15 +1,19 @@
 import os
+import json
 from io import BytesIO
 from datetime import datetime
 
 import streamlit as st
-import numpy as np
-import mediapipe as mp
 from PIL import Image
 import imagehash
-import boto3
-import pymysql
+import numpy as np
 import pandas as pd
+import boto3
+from botocore.exceptions import ClientError
+import pymysql
+import cv2
+
+from insightface.app import FaceAnalysis
 
 
 # =========================
@@ -31,7 +35,7 @@ s3 = boto3.client(
 def get_db_conn():
     return pymysql.connect(
         host=mysql_conf["host"],
-        port=int(mysql_conf.get("port", 3306)),
+        port=mysql_conf.get("port", 3306),
         user=mysql_conf["user"],
         password=mysql_conf["password"],
         db=mysql_conf["database"],
@@ -40,64 +44,117 @@ def get_db_conn():
     )
 
 
+# =========================
+# InsightFace 초기화
+# =========================
 @st.cache_resource
-def get_face_mesh():
-    """Mediapipe FaceMesh 초기화 (CPU, 정지 이미지용)"""
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    return face_mesh
+def get_face_app():
+    """CPU용 InsightFace 초기화"""
+    app = FaceAnalysis(name="buffalo_l")
+    app.prepare(ctx_id=-1, det_size=(256, 256))
+    return app
+
+
+face_app = get_face_app()
 
 
 # =========================
-# 유틸 함수들
+# 유틸 함수 (이미지/해시/임베딩)
 # =========================
-def calc_phash(pil_img) -> imagehash.ImageHash:
-    """PIL 이미지에서 perceptual hash 계산"""
-    return imagehash.phash(pil_img)
+def pil_to_cv2(img: Image.Image):
+    rgb = np.array(img.convert("RGB"))
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    return bgr
 
 
-def hash_similarity(h1, h2) -> float:
-    """두 pHash 사이의 해밍거리 → 유사도(%)"""
-    d = h1 - h2  # 0~64
-    return max(0.0, round((1 - d / 64) * 100, 4))
+def get_face_embedding_from_pil(img: Image.Image):
+    """얼굴 임베딩 512-dim 반환, 실패시 None"""
+    bgr = pil_to_cv2(img)
+    faces = face_app.get(bgr)
+    if not faces:
+        return None
+
+    # 가장 큰 얼굴 선택
+    areas = []
+    for f in faces:
+        x1, y1, x2, y2 = f.bbox.astype(int)
+        areas.append((x2 - x1) * (y2 - y1))
+    best_idx = int(np.argmax(areas))
+    best_face = faces[best_idx]
+
+    emb = best_face["embedding"].astype("float32")
+    norm = np.linalg.norm(emb)
+    if norm > 0:
+        emb = emb / norm
+    return emb
 
 
-def pixel_cosine_similarity(img1: Image.Image, img2: Image.Image, size=(128, 128)) -> float:
-    """
-    두 이미지를 그레이스케일로 리사이즈 후
-    코사인 유사도(0~100%) 계산
-    """
-    g1 = img1.convert("L").resize(size)
-    g2 = img2.convert("L").resize(size)
-
-    v1 = np.asarray(g1, dtype=np.float32).flatten()
-    v2 = np.asarray(g2, dtype=np.float32).flatten()
-
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
-    if n1 == 0 or n2 == 0:
+def cosine_sim(v1, v2):
+    v1 = np.asarray(v1, dtype="float32")
+    v2 = np.asarray(v2, dtype="float32")
+    denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+    if denom == 0:
         return 0.0
-
-    cos = float(np.dot(v1, v2) / (n1 * n2))
-    cos = max(-1.0, min(1.0, cos))
-    return round((cos + 1) / 2 * 100, 4)
+    return float(np.dot(v1, v2) / denom)
 
 
+def crop_center(img: Image.Image, scale_w=0.8, scale_h=0.8):
+    w, h = img.size
+    cw = int(w * scale_w)
+    ch = int(h * scale_h)
+    left = (w - cw) // 2
+    top = (h - ch) // 2
+    return img.crop((left, top, left + cw, top + ch))
+
+
+def crop_top_face_region(img: Image.Image, scale_h=0.6):
+    """윗부분(머리+이마+눈 위주)"""
+    w, h = img.size
+    th = int(h * scale_h)
+    left = int(w * 0.1)
+    right = int(w * 0.9)
+    return img.crop((left, 0, right, th))
+
+
+def calc_multi_phash(img: Image.Image):
+    """full / center / top pHash 계산"""
+    full = imagehash.phash(img)
+    center = imagehash.phash(crop_center(img, 0.7, 0.7))
+    top = imagehash.phash(crop_top_face_region(img, 0.55))
+    return {
+        "full": str(full),
+        "center": str(center),
+        "top": str(top),
+    }
+
+
+def phash_similarity(h1_str, h2_str):
+    """pHash 문자열 유사도 (0~100%)"""
+    if not h1_str or not h2_str:
+        return 0.0
+    h1 = imagehash.hex_to_hash(h1_str)
+    h2 = imagehash.hex_to_hash(h2_str)
+    d = h1 - h2
+    return round((1 - d / 64) * 100, 2)
+
+
+def pixel_cosine_similarity(img1: Image.Image, img2: Image.Image):
+    """중앙영역 gray 64x64 코사인유사도 (0~100%)"""
+    c1 = crop_center(img1, 0.7, 0.7).convert("L").resize((64, 64))
+    c2 = crop_center(img2, 0.7, 0.7).convert("L").resize((64, 64))
+    v1 = np.asarray(c1).flatten().astype("float32")
+    v2 = np.asarray(c2).flatten().astype("float32")
+    s = cosine_sim(v1, v2)
+    return round(s * 100, 2)
+
+
+# =========================
+# DB 관련 함수
+# =========================
 def upload_to_s3(file_like, original_name, prefix="images"):
-    """
-    file_like: BytesIO 또는 파일 객체
-    original_name: 원본 파일명 (확장자 추출용)
-    """
     ext = os.path.splitext(original_name)[1]
     if not ext:
         ext = ".png"
-
     key = f"{prefix}/{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}{ext}"
 
     try:
@@ -105,160 +162,78 @@ def upload_to_s3(file_like, original_name, prefix="images"):
     except ClientError as e:
         err = e.response.get("Error", {})
         st.error(
-            f"S3 업로드 실패: 코드={err.get('Code')} "
+            f"S3 업로드 실패: 코드={err.get('Code')}, "
             f"메시지={err.get('Message')}"
         )
         raise
-
     return key
 
 
-def load_image_from_s3(key) -> Image.Image:
-    """S3 object key로부터 PIL 이미지 로드"""
-    obj = s3.get_object(Bucket=BUCKET, Key=key)
-    return Image.open(BytesIO(obj["Body"].read())).convert("RGB")
-
-
-def insert_image_record(file_name, s3_url, phash_str, description=None):
-    """image_files 테이블에 한 줄 삽입"""
+def insert_image_record(file_name, s3_url, phash_str, phash_json_str,
+                        description=None, face_emb=None):
+    """image_files 한 줄 삽입"""
     conn = get_db_conn()
     with conn:
         with conn.cursor() as cur:
             sql = """
-                INSERT INTO image_files (file_name, s3_url, phash, description)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO image_files
+                (file_name, s3_url, phash, description, uploaded_at, phash_json, face_embedding)
+                VALUES (%s, %s, %s, %s, NOW(), %s, %s)
             """
-            cur.execute(sql, (file_name, s3_url, phash_str, description))
+            face_json = json.dumps(face_emb.tolist()) if face_emb is not None else None
+            cur.execute(
+                sql,
+                (file_name, s3_url, phash_str, description, phash_json_str, face_json),
+            )
         conn.commit()
 
 
-def load_all_images() -> pd.DataFrame:
-    """image_files 테이블 전체 로드"""
+def load_all_images():
     conn = get_db_conn()
     with conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM image_files ORDER BY id DESC")
             rows = cur.fetchall()
-    if not rows:
-        return pd.DataFrame()
     return pd.DataFrame(rows)
 
 
-def save_descriptions(edited_df: pd.DataFrame):
-    """data_editor에서 수정된 description을 DB에 반영"""
+def update_descriptions(df_before: pd.DataFrame, df_after: pd.DataFrame):
+    """description 변경분만 UPDATE"""
+    changed = df_before[["id", "description"]].merge(
+        df_after[["id", "description"]],
+        on="id",
+        how="inner",
+        suffixes=("_before", "_after"),
+    )
+    changed = changed[changed["description_before"] != changed["description_after"]]
+
+    if changed.empty:
+        st.info("변경된 description 이 없습니다.")
+        return
+
     conn = get_db_conn()
     with conn:
         with conn.cursor() as cur:
-            for _, row in edited_df.iterrows():
-                desc = row.get("description")
-                if desc == "":
-                    desc = None
+            for _, row in changed.iterrows():
                 cur.execute(
-                    "UPDATE image_files SET description=%s WHERE id=%s",
-                    (desc, int(row["id"])),
+                    "UPDATE image_files SET description = %s WHERE id = %s",
+                    (row["description_after"], row["id"]),
                 )
         conn.commit()
-
-
-# =========================
-# Mediapipe 얼굴 랜드마크 기반 crop
-# =========================
-def get_face_bbox_from_landmarks(pil_img: Image.Image, face_mesh, min_size=60):
-    """
-    Mediapipe FaceMesh로 얼굴 랜드마크 탐지 후
-    가장 큰 얼굴의 bbox 반환 (x1, y1, x2, y2)
-    """
-    img = np.array(pil_img.convert("RGB"))
-    h, w, _ = img.shape
-
-    results = face_mesh.process(img)
-    if not results.multi_face_landmarks:
-        return None
-
-    lm = results.multi_face_landmarks[0]
-    xs, ys = [], []
-    for pt in lm.landmark:
-        xs.append(pt.x * w)
-        ys.append(pt.y * h)
-
-    x1, x2 = min(xs), max(xs)
-    y1, y2 = min(ys), max(ys)
-
-    fw = x2 - x1
-    fh = y2 - y1
-    if fw < min_size or fh < min_size:
-        return None
-
-    return int(x1), int(y1), int(x2), int(y2)
-
-
-def crop_face_center_or_center(pil_img: Image.Image, face_mesh) -> Image.Image:
-    """
-    1) 얼굴 랜드마크가 잡히면: 얼굴 내부(눈·코·입 중심)만 crop
-    2) 실패하면: 이미지 중앙 기준 crop
-    """
-    w, h = pil_img.size
-    bbox = None
-    try:
-        bbox = get_face_bbox_from_landmarks(pil_img, face_mesh)
-    except Exception:
-        bbox = None
-
-    # 얼굴 탐지 실패 → 단순 중앙 크롭
-    if bbox is None:
-        side = int(min(w, h) * 0.6)
-        left = (w - side) // 2
-        top = (h - side) // 2
-        return pil_img.crop((left, top, left + side, top + side))
-
-    x1, y1, x2, y2 = bbox
-    fw, fh = x2 - x1, y2 - y1
-
-    # 얼굴 bbox 안에서 더 줄여서, 머리카락/장신구는 최대한 제외
-    inner_w = int(fw * 0.65)
-    inner_h = int(fh * 0.55)
-
-    cx = x1 + fw // 2
-    cy = y1 + int(fh * 0.55)  # 약간 아래쪽(코/입 중심)
-
-    left = max(cx - inner_w // 2, 0)
-    top = max(cy - inner_h // 2, 0)
-    right = min(left + inner_w, w)
-    bottom = min(top + inner_h, h)
-
-    return pil_img.crop((left, top, right, bottom))
-
-
-def crop_top(pil_img: Image.Image) -> Image.Image:
-    """이미지 상단(머리+이마 쪽) 위주 크롭"""
-    w, h = pil_img.size
-    side = int(min(w, h) * 0.6)
-    left = (w - side) // 2
-    top = max(int(h * 0.05), 0)
-    bottom = min(top + side, h)
-    return pil_img.crop((left, top, left + side, bottom))
-
-
-def safe_phash_score(s: float, cutoff: float = 30.0) -> float:
-    """
-    pHash 유사도가 cutoff 아래면 기여하지 않도록 0 처리.
-    (너무 낮은 건 '다름'이라고 보고 벌점 대신 무시)
-    """
-    return s if s >= cutoff else 0.0
+    st.success(f"✅ {len(changed)}건의 description 업데이트 완료")
 
 
 # =========================
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="이미지 유사도 검사", layout="wide")
-st.title("🖼 이미지 유사도 검사 (S3 + MySQL + 얼굴 랜드마크 기반 pHash)")
+st.title("🖼 이미지 유사도 검사 (S3 + MySQL + pHash + FaceEmbedding)")
 
-
-tab1, tab2 = st.tabs(["📥 원본 이미지 등록/관리", "🔍 업로드 이미지 비교"])
+tab1, tab2 = st.tabs(["📥 원본 이미지 등록", "🔍 업로드 이미지 비교"])
 
 
 # -------------------------
-# 탭 1: 원본 이미지 등록/관리
+# 탭 1: 원본 이미지 등록
 # -------------------------
 with tab1:
     st.subheader("📥 원본(레퍼런스) 이미지 등록")
@@ -286,117 +261,96 @@ with tab1:
                 if not data:
                     continue
 
-                pil = Image.open(BytesIO(data)).convert("RGB")
+                pil_img = Image.open(BytesIO(data)).convert("RGB")
 
-                # 전체 phash만 DB에 저장(센터/상단은 비교 시에 계산)
-                phash = calc_phash(pil)
-                phash_str = str(phash)
+                # 1) pHash (full/center/top)
+                phash_dict = calc_multi_phash(pil_img)
+                phash_str = phash_dict["full"]
+                phash_json_str = json.dumps(phash_dict)
 
-                # S3 업로드
+                # 2) 얼굴 임베딩
+                face_emb = get_face_embedding_from_pil(pil_img)
+
+                # 3) S3 업로드
                 s3_key = upload_to_s3(BytesIO(data), f.name, prefix="source-images")
                 s3_url = f"s3://{BUCKET}/{s3_key}"
 
-                # DB 기록
+                # 4) DB insert
                 insert_image_record(
                     f.name,
                     s3_url,
                     phash_str,
+                    phash_json_str,
                     description=desc_common if desc_common else None,
+                    face_emb=face_emb,
                 )
                 count += 1
 
             st.success(f"✅ 원본 이미지 {count}개 등록 완료!")
 
-    st.markdown("---")
-    st.markdown("### DB에 저장된 원본 이미지 목록")
+    st.markdown("### DB에 저장된 원본 이미지 목록 (description 수정 가능)")
+    try:
+        df = load_all_images()
+        if df.empty:
+            st.info("아직 저장된 원본 이미지가 없습니다.")
+        else:
+            before_df = df.copy()
 
-    df = load_all_images()
-    if df.empty:
-        st.info("아직 저장된 원본 이미지가 없습니다.")
-    else:
-        # 편집 가능한 테이블 (description만 수정 가능)
-        st.write(
-            "👉 `description` 컬럼을 표에서 직접 수정한 뒤, 아래 **변경 내용 저장** 버튼을 눌러주세요."
-        )
-        edited_df = st.data_editor(
-            df,
-            use_container_width=True,
-            num_rows="fixed",
-            disabled=["id", "file_name", "s3_url", "phash", "uploaded_at"],
-            key="image_table_editor",
-        )
+            edited_df = st.data_editor(
+                df[
+                    [
+                        "id",
+                        "file_name",
+                        "s3_url",
+                        "phash",
+                        "description",
+                        "uploaded_at",
+                        "phash_json",
+                        "face_embedding",
+                    ]
+                ],
+                use_container_width=True,
+                num_rows="fixed",
+                disabled=["id", "file_name", "s3_url", "phash",
+                          "uploaded_at", "phash_json", "face_embedding"],
+                key="image_table_editor",
+            )
 
-        if st.button("💾 변경 내용 저장"):
-            save_descriptions(edited_df)
-            st.success("설명이 DB에 반영되었습니다. (다시 실행하면 최신 내용으로 보입니다)")
+            if st.button("📝 description 변경 내용 저장"):
+                update_descriptions(before_df, edited_df)
 
-        st.markdown("---")
-        st.markdown("### 표지 썸네일 & 미리보기")
-
-        face_mesh = get_face_mesh()
-
-        for _, row in df.iterrows():
-            col1, col2, col3, col4 = st.columns([0.7, 2.5, 1.0, 1.0])
-            with col1:
-                st.markdown(f"**ID**: {row['id']}")
-            with col2:
-                st.markdown(f"**파일명**: {row['file_name']}")
-                st.markdown(f"**설명**: {row['description'] or '설명 없음'}")
-            with col3:
-                # 썸네일 (얼굴 중심 기준 썸네일)
-                key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-                try:
-                    img = load_image_from_s3(key)
-                    thumb = crop_face_center_or_center(img, face_mesh)
-                    st.image(thumb, width=140)
-                except Exception:
-                    st.write("썸네일 오류")
-            with col4:
-                if st.button("미리보기", key=f"preview_{row['id']}"):
-                    st.session_state["preview_id"] = row["id"]
-
-        # 큰 미리보기
-        preview_id = st.session_state.get("preview_id")
-        if preview_id:
-            st.markdown("---")
-            st.markdown("#### 🔍 선택된 이미지 미리보기")
-
-            row = df[df["id"] == preview_id].iloc[0]
-            key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-            img = load_image_from_s3(key)
-            st.image(img, caption=f"ID {row['id']} | {row['file_name']}", use_column_width=True)
+    except Exception as e:
+        st.error(f"DB 조회 오류: {e}")
 
 
 # -------------------------
 # 탭 2: 업로드 이미지 비교
 # -------------------------
 with tab2:
-    st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교 (얼굴 랜드마크 기반 pHash + 픽셀 코사인)")
+    st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교")
 
     cmp_file = st.file_uploader(
         "비교할 이미지 1장을 업로드하세요",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=False,
-        key="cmp_uploader_tab2",
+        key="cmp_uploader_face",
     )
 
     min_score = st.slider("표시할 최소 최종 유사도(%)", 0, 100, 40, 5)
     top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
 
-    st.markdown("### 🛠 가중치 설정")
-    w_full = st.slider("전체 pHash 비중", 0.0, 1.0, 0.05, 0.05)
-    w_center = st.slider("얼굴센터 pHash 비중", 0.0, 1.0, 0.35, 0.05)
-    w_top = st.slider("상단 pHash 비중", 0.0, 1.0, 0.10, 0.05)
-    w_pixel = st.slider("픽셀 코사인(얼굴센터) 비중", 0.0, 1.0, 0.50, 0.05)
+    st.markdown("#### ⚙️ 가중치 설정")
+    w_phash = st.slider("pHash(전체/센터/상단 평균) 비중", 0.0, 1.0, 0.4, 0.05)
+    w_pixel = st.slider("픽셀 코사인(중앙) 비중", 0.0, 1.0, 0.2, 0.05)
+    w_face = st.slider("얼굴 임베딩 코사인 비중", 0.0, 1.0, 0.4, 0.05)
 
-    total_w = w_full + w_center + w_top + w_pixel
+    total_w = w_phash + w_pixel + w_face
     if total_w == 0:
-        w_full = w_center = w_top = w_pixel = 0.25
+        w_phash = w_pixel = w_face = 1 / 3
     else:
-        w_full /= total_w
-        w_center /= total_w
-        w_top /= total_w
+        w_phash /= total_w
         w_pixel /= total_w
+        w_face /= total_w
 
     if st.button("🔎 유사도 분석 실행"):
         if not cmp_file:
@@ -410,62 +364,70 @@ with tab2:
                 if not data:
                     st.error("업로드된 이미지 데이터를 읽을 수 없습니다.")
                 else:
-                    face_mesh = get_face_mesh()
+                    query_img = Image.open(BytesIO(data)).convert("RGB")
 
-                    # 업로드 이미지 준비
-                    pil_cmp = Image.open(BytesIO(data)).convert("RGB")
-                    cmp_full = pil_cmp
-                    cmp_center = crop_face_center_or_center(pil_cmp, face_mesh)
-                    cmp_top = crop_top(pil_cmp)
+                    col_u1, _ = st.columns([1, 2])
+                    with col_u1:
+                        st.markdown("#### 업로드한 이미지")
+                        st.image(query_img, width=250)
 
-                    cmp_full_hash = calc_phash(cmp_full)
-                    cmp_center_hash = calc_phash(cmp_center)
-                    cmp_top_hash = calc_phash(cmp_top)
-
-                    st.markdown("#### 업로드한 이미지")
-                    st.image(pil_cmp, width=260)
+                    # 쿼리 이미지 특징
+                    q_phash_dict = calc_multi_phash(query_img)
+                    query_pix_base = query_img.copy()
+                    q_face_emb = get_face_embedding_from_pil(query_img)
 
                     results = []
+
                     for _, row in src_df.iterrows():
-                        key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+                        # S3에서 이미지 불러오기
                         try:
-                            src_img = load_image_from_s3(key)
+                            key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
+                            obj = s3.get_object(Bucket=BUCKET, Key=key)
+                            db_img = Image.open(BytesIO(obj["Body"].read())).convert("RGB")
                         except Exception:
                             continue
 
-                        src_full = src_img
-                        src_center = crop_face_center_or_center(src_img, face_mesh)
-                        src_top = crop_top(src_img)
-
-                        # full pHash는 DB에 저장된 값 사용
-                        try:
-                            src_full_hash = imagehash.hex_to_hash(row["phash"])
-                        except Exception:
-                            src_full_hash = calc_phash(src_full)
-
-                        src_center_hash = calc_phash(src_center)
-                        src_top_hash = calc_phash(src_top)
-
-                        full_sim = hash_similarity(cmp_full_hash, src_full_hash)
-                        center_sim = hash_similarity(cmp_center_hash, src_center_hash)
-                        top_sim = hash_similarity(cmp_top_hash, src_top_hash)
-                        pixel_sim = pixel_cosine_similarity(cmp_center, src_center)
-
-                        # pHash 컷오프로 너무 낮은 값은 기여하지 않도록
-                        full_sim_safe = safe_phash_score(full_sim, cutoff=30.0)
-                        center_sim_safe = safe_phash_score(center_sim, cutoff=35.0)
-                        top_sim_safe = safe_phash_score(top_sim, cutoff=35.0)
-
-                        # 얼굴 구조가 너무 다르면(센터 pHash+픽셀 둘 다 낮으면) 과감히 버리기
-                        if center_sim < 30 and pixel_sim < 65:
-                            final_score = 0.0
+                        # DB의 phash_json
+                        if row.get("phash_json"):
+                            try:
+                                db_phash_dict = json.loads(row["phash_json"])
+                            except Exception:
+                                db_phash_dict = {"full": row.get("phash")}
                         else:
-                            final_score = (
-                                w_full * full_sim_safe
-                                + w_center * center_sim_safe
-                                + w_top * top_sim_safe
-                                + w_pixel * pixel_sim
-                            )
+                            db_phash_dict = {"full": row.get("phash")}
+
+                        full_sim = phash_similarity(
+                            q_phash_dict.get("full"),
+                            db_phash_dict.get("full"),
+                        )
+                        center_sim = phash_similarity(
+                            q_phash_dict.get("center"),
+                            db_phash_dict.get("center"),
+                        )
+                        top_sim = phash_similarity(
+                            q_phash_dict.get("top"),
+                            db_phash_dict.get("top"),
+                        )
+
+                        valid_vals = [v for v in [full_sim, center_sim, top_sim] if v is not None]
+                        phash_mean = sum(valid_vals) / len(valid_vals) if valid_vals else 0.0
+
+                        pixel_sim = pixel_cosine_similarity(query_pix_base, db_img)
+
+                        face_sim = 0.0
+                        if q_face_emb is not None and row.get("face_embedding"):
+                            try:
+                                db_emb_list = json.loads(row["face_embedding"])
+                                if isinstance(db_emb_list, list) and len(db_emb_list) > 0:
+                                    face_sim = cosine_sim(q_face_emb, db_emb_list) * 100.0
+                            except Exception:
+                                face_sim = 0.0
+
+                        final_score = (
+                            w_phash * phash_mean
+                            + w_pixel * pixel_sim
+                            + w_face * face_sim
+                        )
 
                         if final_score >= min_score:
                             results.append(
@@ -474,16 +436,18 @@ with tab2:
                                     "file_name": row["file_name"],
                                     "s3_url": row["s3_url"],
                                     "description": row.get("description"),
-                                    "full_sim": round(full_sim, 2),
-                                    "center_sim": round(center_sim, 2),
-                                    "top_sim": round(top_sim, 2),
+                                    "phash_full": round(full_sim, 2),
+                                    "phash_center": round(center_sim, 2),
+                                    "phash_top": round(top_sim, 2),
+                                    "phash_mean": round(phash_mean, 2),
                                     "pixel_sim": round(pixel_sim, 2),
+                                    "face_sim": round(face_sim, 2),
                                     "final_score": round(final_score, 2),
                                 }
                             )
 
                     if not results:
-                        st.info(f"유사도 {min_score}% 이상 결과가 없습니다.")
+                        st.info(f"최종 유사도 {min_score}% 이상 결과가 없습니다.")
                     else:
                         res_df = (
                             pd.DataFrame(results)
@@ -491,25 +455,25 @@ with tab2:
                             .head(top_n)
                         )
 
-                        st.markdown("### 유사도 결과 (얼굴 랜드마크 기반 pHash + 픽셀 코사인 + 최종)")
+                        st.markdown(f"#### 유사도 결과 (상위 {len(res_df)}개)")
                         for _, r in res_df.iterrows():
-                            col1, col2 = st.columns([1.2, 2.0])
+                            col1, col2 = st.columns([1, 2])
                             with col1:
                                 key = r["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
-                                img = load_image_from_s3(key)
-                                thumb = crop_face_center_or_center(img, face_mesh)
+                                obj = s3.get_object(Bucket=BUCKET, Key=key)
+                                img = Image.open(BytesIO(obj["Body"].read())).convert("RGB")
                                 st.image(
-                                    thumb,
+                                    img,
                                     caption=f"ID {r['id']} | {r['file_name']}",
-                                    use_column_width=True,
                                 )
                             with col2:
                                 st.write(f"**최종 유사도:** {r['final_score']}%")
                                 st.write(
-                                    f"• pHash 전체: {r['full_sim']}% / "
-                                    f"얼굴센터: {r['center_sim']}% / 상단: {r['top_sim']}%"
+                                    f"- pHash 평균: {r['phash_mean']}% "
+                                    f"(full: {r['phash_full']} / center: {r['phash_center']} / top: {r['phash_top']})"
                                 )
-                                st.write(f"• 픽셀 코사인(얼굴센터, Gray): {r['pixel_sim']}%")
-                                st.write(f"**설명:** {r['description'] or '설명 없음'}")
+                                st.write(f"- 픽셀 코사인(중앙): {r['pixel_sim']}%")
+                                st.write(f"- 얼굴 임베딩 코사인: {r['face_sim']}%")
+                                st.write(f"**파일명:** {r['file_name']}")
                                 st.write(f"**S3 경로:** `{r['s3_url']}`")
-                                st.markdown("---")
+                                st.write(f"**설명:** {r['description'] or '설명 없음'}")
