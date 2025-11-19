@@ -89,13 +89,21 @@ def get_face_embedding_from_pil(img: Image.Image):
     best_idx = int(np.argmax(areas))
     best_face = faces[best_idx]
 
-    # face.embedding 속성 사용 (로컬 테스트에서 확인했던 방식)
-    emb = best_face.embedding.astype("float32")
+    # ❗ InsightFace 버전에 따라 normed_embedding / embedding 중 어느 쪽이 실제 값인지 달라서
+    emb = getattr(best_face, "normed_embedding", None)
+    if emb is None:
+        emb = getattr(best_face, "embedding", None)
 
-    # 코사인 유사도 계산을 위한 L2 정규화
+    if emb is None:
+        return None
+
+    emb = np.asarray(emb, dtype="float32")
+
+    # 혹시라도 정규화 안 되어 있으면 한 번 더 정규화
     norm = np.linalg.norm(emb)
     if norm > 0:
         emb = emb / norm
+
     return emb
 
 
