@@ -3,14 +3,13 @@ from io import BytesIO
 from datetime import datetime
 
 import streamlit as st
+import numpy as np
+import mediapipe as mp
 from PIL import Image
 import imagehash
 import boto3
-from botocore.exceptions import ClientError
 import pymysql
 import pandas as pd
-import numpy as np
-import mediapipe as mp
 
 
 # =========================
