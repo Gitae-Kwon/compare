@@ -10,8 +10,7 @@ from botocore.exceptions import ClientError
 import pymysql
 import pandas as pd
 import numpy as np
-
-from insightface.app import FaceAnalysis  # 얼굴 검출 + 임베딩
+import mediapipe as mp
 
 
 # =========================
@@ -43,11 +42,17 @@ def get_db_conn():
 
 
 @st.cache_resource
-def get_face_app():
-    """InsightFace RetinaFace + ArcFace 초기화 (CPU 사용)"""
-    app = FaceAnalysis(name="buffalo_l")
-    app.prepare(ctx_id=-1, det_size=(256, 256))  # CPU
-    return app
+def get_face_mesh():
+    """Mediapipe FaceMesh 초기화 (CPU, 정지 이미지용)"""
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return face_mesh
 
 
 # =========================
@@ -157,51 +162,48 @@ def save_descriptions(edited_df: pd.DataFrame):
 
 
 # =========================
-# 얼굴 기반 센터 크롭 관련
+# Mediapipe 얼굴 랜드마크 기반 crop
 # =========================
-def detect_main_face_bbox(pil_img: Image.Image, app: FaceAnalysis, min_size=80):
+def get_face_bbox_from_landmarks(pil_img: Image.Image, face_mesh, min_size=60):
     """
-    PIL 이미지를 받아서 InsightFace로 가장 큰 얼굴의 bbox를 반환.
-    bbox 형식: (x1, y1, x2, y2) / 없으면 None
+    Mediapipe FaceMesh로 얼굴 랜드마크 탐지 후
+    가장 큰 얼굴의 bbox 반환 (x1, y1, x2, y2)
     """
-    img = np.array(pil_img.convert("RGB"))[:, :, ::-1]  # RGB -> BGR
-    faces = app.get(img)
-    if not faces:
+    img = np.array(pil_img.convert("RGB"))
+    h, w, _ = img.shape
+
+    results = face_mesh.process(img)
+    if not results.multi_face_landmarks:
         return None
 
-    valid_faces = []
-    for f in faces:
-        x1, y1, x2, y2 = f.bbox
-        w = x2 - x1
-        h = y2 - y1
-        if w >= min_size and h >= min_size:
-            valid_faces.append(f)
+    lm = results.multi_face_landmarks[0]
+    xs, ys = [], []
+    for pt in lm.landmark:
+        xs.append(pt.x * w)
+        ys.append(pt.y * h)
 
-    if not valid_faces:
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+
+    fw = x2 - x1
+    fh = y2 - y1
+    if fw < min_size or fh < min_size:
         return None
 
-    # 가장 큰 얼굴 선택
-    main = max(
-        valid_faces,
-        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
-    )
-    x1, y1, x2, y2 = main.bbox
     return int(x1), int(y1), int(x2), int(y2)
 
 
-def crop_face_center_or_center(pil_img: Image.Image, app: FaceAnalysis | None = None) -> Image.Image:
+def crop_face_center_or_center(pil_img: Image.Image, face_mesh) -> Image.Image:
     """
-    1) 얼굴 탐지가 되면: bbox 기준으로 눈·코·입 주변(머리/장신구 거의 제외)만 크롭
-    2) 얼굴 탐지가 안 되면: 이미지 중앙 기준 크롭으로 fallback
+    1) 얼굴 랜드마크가 잡히면: 얼굴 내부(눈·코·입 중심)만 crop
+    2) 실패하면: 이미지 중앙 기준 crop
     """
     w, h = pil_img.size
-
     bbox = None
-    if app is not None:
-        try:
-            bbox = detect_main_face_bbox(pil_img, app)
-        except Exception:
-            bbox = None
+    try:
+        bbox = get_face_bbox_from_landmarks(pil_img, face_mesh)
+    except Exception:
+        bbox = None
 
     # 얼굴 탐지 실패 → 단순 중앙 크롭
     if bbox is None:
@@ -213,14 +215,12 @@ def crop_face_center_or_center(pil_img: Image.Image, app: FaceAnalysis | None = 
     x1, y1, x2, y2 = bbox
     fw, fh = x2 - x1, y2 - y1
 
-    # 얼굴 bbox 안에서 "중앙 부분"만 다시 줄여서 사용
-    #   - 좌우 60%만 사용 → 양쪽 머리카락/귀/장신구 잘림
-    #   - 세로는 약 50%만 사용, 중심을 약간 아래로 → 눈·코·입 중심
-    inner_w = int(fw * 0.6)
-    inner_h = int(fh * 0.5)
+    # 얼굴 bbox 안에서 더 줄여서, 머리카락/장신구는 최대한 제외
+    inner_w = int(fw * 0.65)
+    inner_h = int(fh * 0.55)
 
     cx = x1 + fw // 2
-    cy = y1 + int(fh * 0.55)   # 얼굴 전체보다 살짝 아래(코/입 쪽)
+    cy = y1 + int(fh * 0.55)  # 약간 아래쪽(코/입 중심)
 
     left = max(cx - inner_w // 2, 0)
     top = max(cy - inner_h // 2, 0)
@@ -240,11 +240,20 @@ def crop_top(pil_img: Image.Image) -> Image.Image:
     return pil_img.crop((left, top, left + side, bottom))
 
 
+def safe_phash_score(s: float, cutoff: float = 30.0) -> float:
+    """
+    pHash 유사도가 cutoff 아래면 기여하지 않도록 0 처리.
+    (너무 낮은 건 '다름'이라고 보고 벌점 대신 무시)
+    """
+    return s if s >= cutoff else 0.0
+
+
 # =========================
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="이미지 유사도 검사", layout="wide")
-st.title("🖼 이미지 유사도 검사 (S3 + MySQL + pHash + 얼굴센터)")
+st.title("🖼 이미지 유사도 검사 (S3 + MySQL + 얼굴 랜드마크 기반 pHash)")
+
 
 tab1, tab2 = st.tabs(["📥 원본 이미지 등록/관리", "🔍 업로드 이미지 비교"])
 
@@ -325,7 +334,7 @@ with tab1:
         st.markdown("---")
         st.markdown("### 표지 썸네일 & 미리보기")
 
-        face_app = get_face_app()
+        face_mesh = get_face_mesh()
 
         for _, row in df.iterrows():
             col1, col2, col3, col4 = st.columns([0.7, 2.5, 1.0, 1.0])
@@ -339,9 +348,9 @@ with tab1:
                 key = row["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
                 try:
                     img = load_image_from_s3(key)
-                    thumb = crop_face_center_or_center(img, face_app)
+                    thumb = crop_face_center_or_center(img, face_mesh)
                     st.image(thumb, width=140)
-                except Exception as e:
+                except Exception:
                     st.write("썸네일 오류")
             with col4:
                 if st.button("미리보기", key=f"preview_{row['id']}"):
@@ -363,7 +372,7 @@ with tab1:
 # 탭 2: 업로드 이미지 비교
 # -------------------------
 with tab2:
-    st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교 (pHash 멀티크롭 + 얼굴센터 + 픽셀 코사인)")
+    st.subheader("🔍 업로드 이미지와 원본 DB 유사도 비교 (얼굴 랜드마크 기반 pHash + 픽셀 코사인)")
 
     cmp_file = st.file_uploader(
         "비교할 이미지 1장을 업로드하세요",
@@ -376,10 +385,10 @@ with tab2:
     top_n = st.slider("상위 몇 개까지 볼까요?", 1, 20, 5)
 
     st.markdown("### 🛠 가중치 설정")
-    w_full = st.slider("전체 pHash 비중", 0.0, 1.0, 0.10, 0.05)
-    w_center = st.slider("얼굴센터 pHash 비중", 0.0, 1.0, 0.30, 0.05)
-    w_top = st.slider("상단 pHash 비중", 0.0, 1.0, 0.20, 0.05)
-    w_pixel = st.slider("픽셀 코사인(얼굴센터) 비중", 0.0, 1.0, 0.40, 0.05)
+    w_full = st.slider("전체 pHash 비중", 0.0, 1.0, 0.05, 0.05)
+    w_center = st.slider("얼굴센터 pHash 비중", 0.0, 1.0, 0.35, 0.05)
+    w_top = st.slider("상단 pHash 비중", 0.0, 1.0, 0.10, 0.05)
+    w_pixel = st.slider("픽셀 코사인(얼굴센터) 비중", 0.0, 1.0, 0.50, 0.05)
 
     total_w = w_full + w_center + w_top + w_pixel
     if total_w == 0:
@@ -402,12 +411,12 @@ with tab2:
                 if not data:
                     st.error("업로드된 이미지 데이터를 읽을 수 없습니다.")
                 else:
-                    face_app = get_face_app()
+                    face_mesh = get_face_mesh()
 
                     # 업로드 이미지 준비
                     pil_cmp = Image.open(BytesIO(data)).convert("RGB")
                     cmp_full = pil_cmp
-                    cmp_center = crop_face_center_or_center(pil_cmp, face_app)
+                    cmp_center = crop_face_center_or_center(pil_cmp, face_mesh)
                     cmp_top = crop_top(pil_cmp)
 
                     cmp_full_hash = calc_phash(cmp_full)
@@ -426,7 +435,7 @@ with tab2:
                             continue
 
                         src_full = src_img
-                        src_center = crop_face_center_or_center(src_img, face_app)
+                        src_center = crop_face_center_or_center(src_img, face_mesh)
                         src_top = crop_top(src_img)
 
                         # full pHash는 DB에 저장된 값 사용
@@ -443,12 +452,21 @@ with tab2:
                         top_sim = hash_similarity(cmp_top_hash, src_top_hash)
                         pixel_sim = pixel_cosine_similarity(cmp_center, src_center)
 
-                        final_score = (
-                            w_full * full_sim
-                            + w_center * center_sim
-                            + w_top * top_sim
-                            + w_pixel * pixel_sim
-                        )
+                        # pHash 컷오프로 너무 낮은 값은 기여하지 않도록
+                        full_sim_safe = safe_phash_score(full_sim, cutoff=30.0)
+                        center_sim_safe = safe_phash_score(center_sim, cutoff=35.0)
+                        top_sim_safe = safe_phash_score(top_sim, cutoff=35.0)
+
+                        # 얼굴 구조가 너무 다르면(센터 pHash+픽셀 둘 다 낮으면) 과감히 버리기
+                        if center_sim < 30 and pixel_sim < 65:
+                            final_score = 0.0
+                        else:
+                            final_score = (
+                                w_full * full_sim_safe
+                                + w_center * center_sim_safe
+                                + w_top * top_sim_safe
+                                + w_pixel * pixel_sim
+                            )
 
                         if final_score >= min_score:
                             results.append(
@@ -474,13 +492,13 @@ with tab2:
                             .head(top_n)
                         )
 
-                        st.markdown("### 유사도 결과 (pHash 전체/얼굴센터/상단 + 픽셀 코사인 + 최종)")
+                        st.markdown("### 유사도 결과 (얼굴 랜드마크 기반 pHash + 픽셀 코사인 + 최종)")
                         for _, r in res_df.iterrows():
                             col1, col2 = st.columns([1.2, 2.0])
                             with col1:
                                 key = r["s3_url"].split(f"s3://{BUCKET}/", 1)[-1]
                                 img = load_image_from_s3(key)
-                                thumb = crop_face_center_or_center(img, face_app)
+                                thumb = crop_face_center_or_center(img, face_mesh)
                                 st.image(
                                     thumb,
                                     caption=f"ID {r['id']} | {r['file_name']}",
